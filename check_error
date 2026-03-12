@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+from botocore.exceptions import ClientError, NoCredentialsError
+from datetime import datetime, timezone
+
+
+# ==================================================
+# SESSION CREATION
+# ==================================================
+
+def get_session(role_arn=None):
+    try:
+        if role_arn:
+            print("\nAttempting to assume role...\n")
+            base = boto3.Session()
+            sts = base.client("sts")
+
+            assumed = sts.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName="auth-diagnostic",
+                DurationSeconds=3600
+            )
+
+            creds = assumed["Credentials"]
+
+            print("STS AssumeRole SUCCESS")
+            print("Expiration:", creds["Expiration"])
+
+            session = boto3.Session(
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+            )
+
+            return session
+
+        else:
+            print("\nUsing base AWS credentials (no -R provided)\n")
+            return boto3.Session()
+
+    except ClientError as e:
+        print("\nERROR during AssumeRole:")
+        print(e)
+        return None
+
+
+# ==================================================
+# IDENTITY CHECK
+# ==================================================
+
+def check_identity(session):
+    try:
+        sts = session.client("sts")
+        identity = sts.get_caller_identity()
+
+        print("Caller Identity:")
+        print(identity)
+        return True
+
+    except Exception as e:
+        print("\nFAILED to get caller identity:")
+        print(e)
+        return False
+
+
+# ==================================================
+# REGION + SNAPSHOT TEST
+# ==================================================
+
+def test_regions(session):
+    try:
+        ec2 = session.client("ec2", region_name="us-east-1")
+        regions = ec2.describe_regions()["Regions"]
+        region_list = [r["RegionName"] for r in regions]
+    except Exception as e:
+        print("\nFAILED to list regions:")
+        print(e)
+        return
+
+    print("\nTesting DescribeSnapshots in all regions...\n")
+
+    for region in region_list:
+        print(f"Region: {region}")
+
+        try:
+            ec2 = session.client("ec2", region_name=region)
+            ec2.describe_snapshots(OwnerIds=["self"], MaxResults=1)
+            print("  ✅ DescribeSnapshots SUCCESS")
+
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            print(f"  ❌ ClientError: {error_code}")
+            print(f"     Message: {e.response['Error']['Message']}")
+
+        except Exception as e:
+            print("  ❌ Unknown Error:", e)
+
+    print("\nRegion testing complete.\n")
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AWS Authentication Diagnostic Script"
+    )
+    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    if not session:
+        print("Session creation failed. Exiting.")
+        return
+
+    print("\n==========================================")
+    print("CHECKING CALLER IDENTITY")
+    print("==========================================\n")
+
+    if not check_identity(session):
+        print("\nCredentials are invalid or expired.")
+        return
+
+    print("\n==========================================")
+    print("CHECKING REGION ACCESS")
+    print("==========================================")
+
+    test_regions(session)
+
+    print("Diagnostic complete.\n")
+
+
+if __name__ == "__main__":
+    main()
