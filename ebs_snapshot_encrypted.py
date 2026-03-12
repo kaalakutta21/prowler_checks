@@ -31,7 +31,7 @@ def get_account_id(session):
     return session.client("sts").get_caller_identity()["Account"]
 
 # ==================================================
-# REGIONS
+# REGIONS (SAFE FILTER)
 # ==================================================
 
 def get_regions(session):
@@ -61,9 +61,7 @@ def check_ebs_snapshot_encryption(session):
 
         try:
             ec2 = session.client("ec2", region_name=region)
-
             paginator = ec2.get_paginator("describe_snapshots")
-
             page_iterator = paginator.paginate(OwnerIds=['self'])
 
         except ClientError as e:
@@ -73,31 +71,44 @@ def check_ebs_snapshot_encryption(session):
                 print(f"Skipping region {region} (not accessible)")
                 continue
             else:
-                raise
+                print(f"Unexpected error in region {region}: {e}")
+                continue
 
-        for page in page_iterator:
-            snapshots = page.get("Snapshots", [])
+        # IMPORTANT: Catch AuthFailure during pagination iteration
+        try:
+            for page in page_iterator:
+                snapshots = page.get("Snapshots", [])
 
-            for snap in snapshots:
-                total_checked += 1
+                for snap in snapshots:
+                    total_checked += 1
 
-                snapshot_id = snap["SnapshotId"]
-                encrypted = snap.get("Encrypted", False)
-                kms_key = snap.get("KmsKeyId", "")
+                    snapshot_id = snap["SnapshotId"]
+                    encrypted = snap.get("Encrypted", False)
+                    kms_key = snap.get("KmsKeyId", "")
 
-                if encrypted:
-                    status = "COMPLIANT"
-                else:
-                    status = "NON_COMPLIANT"
-                    non_compliant += 1
+                    if encrypted:
+                        status = "COMPLIANT"
+                    else:
+                        status = "NON_COMPLIANT"
+                        non_compliant += 1
 
-                results.append({
-                    "Region": region,
-                    "SnapshotId": snapshot_id,
-                    "Encrypted": encrypted,
-                    "KmsKeyId": kms_key,
-                    "Status": status
-                })
+                    results.append({
+                        "Region": region,
+                        "SnapshotId": snapshot_id,
+                        "Encrypted": encrypted,
+                        "KmsKeyId": kms_key,
+                        "Status": status
+                    })
+
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+
+            if error_code in ["AuthFailure", "OptInRequired"]:
+                print(f"Skipping region {region} during snapshot scan (not accessible)")
+                continue
+            else:
+                print(f"Unexpected pagination error in region {region}: {e}")
+                continue
 
     compliant = total_checked - non_compliant
 
@@ -143,7 +154,12 @@ def main():
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
-    account_id = get_account_id(session)
+
+    try:
+        account_id = get_account_id(session)
+    except Exception as e:
+        print("Credential validation failed:", e)
+        return
 
     results, total_checked, compliant, non_compliant = \
         check_ebs_snapshot_encryption(session)
