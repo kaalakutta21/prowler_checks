@@ -57,52 +57,47 @@ def check_ebs_snapshot_encryption(session):
     non_compliant = 0
     total_checked = 0
 
-    for region in tqdm(regions, desc="Scanning Regions"):
+for region in tqdm(regions, desc="Scanning Regions"):
 
-try:
-    ec2 = session.client("ec2", region_name=region)
-except ClientError as e:
-    error_code = e.response["Error"]["Code"]
-    if error_code in ["AuthFailure", "OptInRequired"]:
-        print(f"Skipping region {region} (not accessible)")
-        continue
-    else:
-        raise
+    try:
+        ec2 = session.client("ec2", region_name=region)
+
         paginator = ec2.get_paginator("describe_snapshots")
 
-try:
-    page_iterator = paginator.paginate(OwnerIds=['self'])
-except ClientError as e:
-    error_code = e.response["Error"]["Code"]
-    if error_code in ["AuthFailure", "OptInRequired"]:
-        print(f"Skipping region {region} (not accessible)")
-        continue
-    else:
-        raise
+        page_iterator = paginator.paginate(OwnerIds=['self'])
 
-        for page in page_iterator:
-            snapshots = page.get("Snapshots", [])
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
 
-            for snap in snapshots:
-                total_checked += 1
+        if error_code in ["AuthFailure", "OptInRequired"]:
+            print(f"Skipping region {region} (not accessible)")
+            continue
+        else:
+            raise
 
-                snapshot_id = snap["SnapshotId"]
-                encrypted = snap.get("Encrypted", False)
-                kms_key = snap.get("KmsKeyId", "")
+    for page in page_iterator:
+        snapshots = page.get("Snapshots", [])
 
-                if encrypted:
-                    status = "COMPLIANT"
-                else:
-                    status = "NON_COMPLIANT"
-                    non_compliant += 1
+        for snap in snapshots:
+            total_checked += 1
 
-                results.append({
-                    "Region": region,
-                    "SnapshotId": snapshot_id,
-                    "Encrypted": encrypted,
-                    "KmsKeyId": kms_key,
-                    "Status": status
-                })
+            snapshot_id = snap["SnapshotId"]
+            encrypted = snap.get("Encrypted", False)
+            kms_key = snap.get("KmsKeyId", "")
+
+            if encrypted:
+                status = "COMPLIANT"
+            else:
+                status = "NON_COMPLIANT"
+                non_compliant += 1
+
+            results.append({
+                "Region": region,
+                "SnapshotId": snapshot_id,
+                "Encrypted": encrypted,
+                "KmsKeyId": kms_key,
+                "Status": status
+            })
 
     compliant = total_checked - non_compliant
 
