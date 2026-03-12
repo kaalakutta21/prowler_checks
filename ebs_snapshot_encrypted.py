@@ -36,7 +36,14 @@ def get_account_id(session):
 
 def get_regions(session):
     ec2 = session.client("ec2", region_name="us-east-1")
-    return [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
 
 # ==================================================
 # CONTROL LOGIC
@@ -52,14 +59,26 @@ def check_ebs_snapshot_encryption(session):
 
     for region in tqdm(regions, desc="Scanning Regions"):
 
-        ec2 = session.client("ec2", region_name=region)
-
+try:
+    ec2 = session.client("ec2", region_name=region)
+except ClientError as e:
+    error_code = e.response["Error"]["Code"]
+    if error_code in ["AuthFailure", "OptInRequired"]:
+        print(f"Skipping region {region} (not accessible)")
+        continue
+    else:
+        raise
         paginator = ec2.get_paginator("describe_snapshots")
 
-        try:
-            page_iterator = paginator.paginate(OwnerIds=['self'])
-        except ClientError:
-            continue
+try:
+    page_iterator = paginator.paginate(OwnerIds=['self'])
+except ClientError as e:
+    error_code = e.response["Error"]["Code"]
+    if error_code in ["AuthFailure", "OptInRequired"]:
+        print(f"Skipping region {region} (not accessible)")
+        continue
+    else:
+        raise
 
         for page in page_iterator:
             snapshots = page.get("Snapshots", [])
