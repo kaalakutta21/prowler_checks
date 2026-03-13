@@ -7,33 +7,56 @@ import json
 from tqdm import tqdm
 from botocore.exceptions import ClientError
 
+GREEN = "\033[92m"
+RED = "\033[91m"
+PURPLE = "\033[95m"
+RESET = "\033[0m"
+
 # ==================================================
 # AUTH
 # ==================================================
 
 def get_session(role_arn=None):
+
     if role_arn:
         base = boto3.Session()
         sts = base.client("sts")
+
         assumed = sts.assume_role(
             RoleArn=role_arn,
             RoleSessionName="s3-advanced-audit"
         )
+
         creds = assumed["Credentials"]
 
         return boto3.Session(
             aws_access_key_id=creds["AccessKeyId"],
             aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-            region_name="us-east-1"
+            aws_session_token=creds["SessionToken"]
         )
-    return boto3.Session(region_name="us-east-1")
+
+    return boto3.Session()
+
 
 def get_account_id(session):
     return session.client("sts").get_caller_identity()["Account"]
 
+
 # ==================================================
-# POLICY CHECK: DENY INSECURE TRANSPORT
+# REGION DISCOVERY
+# ==================================================
+
+def get_active_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=False)["Regions"]
+
+    return [r["RegionName"] for r in regions]
+
+
+# ==================================================
+# POLICY CHECK
 # ==================================================
 
 def denies_insecure_transport(policy_doc):
@@ -44,13 +67,17 @@ def denies_insecure_transport(policy_doc):
         statements = [statements]
 
     for stmt in statements:
+
         if stmt.get("Effect") == "Deny":
+
             condition = stmt.get("Condition", {})
             bool_condition = condition.get("Bool", {})
+
             if bool_condition.get("aws:SecureTransport") == "false":
                 return True
 
     return False
+
 
 # ==================================================
 # MAIN CONTROL LOGIC
@@ -59,12 +86,16 @@ def denies_insecure_transport(policy_doc):
 def check_s3_controls(session):
 
     s3 = session.client("s3")
+
     account_id = get_account_id(session)
 
-    buckets = s3.list_buckets().get("Buckets", [])
-    print(f"\nTotal Buckets Found: {len(buckets)}\n")
+    buckets = s3.list_buckets()["Buckets"]
+
+    print(f"\nBuckets discovered: {len(buckets)}\n")
 
     results = []
+
+    non_compliant_details = []
 
     summary = {
         "Deny Insecure Transport": {"total": 0, "non_compliant": 0},
@@ -78,8 +109,9 @@ def check_s3_controls(session):
         bucket_name = bucket["Name"]
 
         # -------------------------------------------------
-        # 1) DENY INSECURE TRANSPORT
+        # DENY INSECURE TRANSPORT
         # -------------------------------------------------
+
         control = "Deny Insecure Transport"
         summary[control]["total"] += 1
 
@@ -87,134 +119,186 @@ def check_s3_controls(session):
             policy = s3.get_bucket_policy(Bucket=bucket_name)
             policy_doc = json.loads(policy["Policy"])
             secure = denies_insecure_transport(policy_doc)
+
         except ClientError:
             secure = False
 
-        if secure:
-            status = "COMPLIANT"
-        else:
-            status = "NON_COMPLIANT"
+        status = "COMPLIANT" if secure else "NON_COMPLIANT"
+
+        if not secure:
             summary[control]["non_compliant"] += 1
+            non_compliant_details.append((bucket_name, control))
 
         results.append([bucket_name, control, status])
 
         # -------------------------------------------------
-        # 2) OBJECT LOCK ENABLED
+        # OBJECT LOCK
         # -------------------------------------------------
+
         control = "Object Lock Enabled"
         summary[control]["total"] += 1
 
         try:
             lock = s3.get_object_lock_configuration(Bucket=bucket_name)
-            enabled = lock.get("ObjectLockConfiguration", {}).get("ObjectLockEnabled") == "Enabled"
+
+            enabled = (
+                lock.get("ObjectLockConfiguration", {})
+                .get("ObjectLockEnabled") == "Enabled"
+            )
+
         except ClientError:
             enabled = False
 
-        if enabled:
-            status = "COMPLIANT"
-        else:
-            status = "NON_COMPLIANT"
+        status = "COMPLIANT" if enabled else "NON_COMPLIANT"
+
+        if not enabled:
             summary[control]["non_compliant"] += 1
+            non_compliant_details.append((bucket_name, control))
 
         results.append([bucket_name, control, status])
 
         # -------------------------------------------------
-        # 3) LIFECYCLE CONFIGURATION
+        # LIFECYCLE CONFIGURATION
         # -------------------------------------------------
+
         control = "Lifecycle Configuration Enabled"
         summary[control]["total"] += 1
 
         try:
             lifecycle = s3.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+
             has_rules = len(lifecycle.get("Rules", [])) > 0
+
         except ClientError:
             has_rules = False
 
-        if has_rules:
-            status = "COMPLIANT"
-        else:
-            status = "NON_COMPLIANT"
+        status = "COMPLIANT" if has_rules else "NON_COMPLIANT"
+
+        if not has_rules:
             summary[control]["non_compliant"] += 1
+            non_compliant_details.append((bucket_name, control))
 
         results.append([bucket_name, control, status])
 
         # -------------------------------------------------
-        # 4) EVENT NOTIFICATIONS
+        # EVENT NOTIFICATIONS
         # -------------------------------------------------
+
         control = "Event Notification Enabled"
         summary[control]["total"] += 1
 
         try:
-            notification = s3.get_bucket_notification_configuration(Bucket=bucket_name)
+            notification = s3.get_bucket_notification_configuration(
+                Bucket=bucket_name
+            )
+
             enabled = any([
                 notification.get("LambdaFunctionConfigurations"),
                 notification.get("QueueConfigurations"),
                 notification.get("TopicConfigurations")
             ])
+
         except ClientError:
             enabled = False
 
-        if enabled:
-            status = "COMPLIANT"
-        else:
-            status = "NON_COMPLIANT"
+        status = "COMPLIANT" if enabled else "NON_COMPLIANT"
+
+        if not enabled:
             summary[control]["non_compliant"] += 1
+            non_compliant_details.append((bucket_name, control))
 
         results.append([bucket_name, control, status])
 
-    return account_id, results, summary
+    return account_id, results, summary, non_compliant_details
+
 
 # ==================================================
 # CSV OUTPUT
 # ==================================================
 
 def write_csv(account_id, results):
+
     filename = f"s3_advanced_controls_{account_id}.csv"
 
     with open(filename, "w", newline="") as f:
+
         writer = csv.writer(f)
-        writer.writerow(["Account", "BucketName", "Control", "Status"])
+
+        writer.writerow([
+            "Account",
+            "BucketName",
+            "Control",
+            "Status"
+        ])
 
         for bucket, control, status in results:
             writer.writerow([account_id, bucket, control, status])
 
     return filename
 
+
 # ==================================================
 # MAIN
 # ==================================================
 
 def main():
+
     parser = argparse.ArgumentParser(
         description="Advanced S3 Security Controls Audit"
     )
-    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+
+    parser.add_argument(
+        "-R",
+        "--role-arn",
+        help="Role ARN to assume"
+    )
+
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
 
-    account_id, results, summary = check_s3_controls(session)
+    account_id, results, summary, non_compliant = check_s3_controls(session)
 
-    print("\n====================================================")
-    print("S3 ADVANCED SECURITY CONTROLS")
+    print("\n================================================")
+    print("S3 ADVANCED SECURITY CONTROLS AUDIT")
     print(f"ACCOUNT: {account_id}")
-    print("====================================================\n")
+    print("================================================\n")
 
     for control, data in summary.items():
-        total = data["total"]
-        non_compliant = data["non_compliant"]
-        compliant = total - non_compliant
-        overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
 
-        print(f"CONTROL: {control}")
+        total = data["total"]
+        non_compliant_count = data["non_compliant"]
+        compliant = total - non_compliant_count
+
+        if non_compliant_count == 0:
+            status = f"{GREEN}COMPLIANT{RESET}"
+        else:
+            status = f"{RED}NON_COMPLIANT{RESET}"
+
+        print(f"{control}")
         print(f"  Total Checked : {total}")
         print(f"  Compliant     : {compliant}")
-        print(f"  Non-Compliant : {non_compliant}")
-        print(f"  OVERALL       : {overall}")
-        print("----------------------------------------------------")
+        print(f"  Non-Compliant : {non_compliant_count}")
+        print(f"  Overall       : {status}")
+        print("------------------------------------------------")
+
+    # Detailed findings
+
+    if non_compliant:
+
+        print(f"\n{PURPLE}NON-COMPLIANT RESOURCES{RESET}\n")
+
+        for bucket, control in non_compliant:
+            print(f"{bucket} -> {control}")
+
+    else:
+
+        print(f"\n{GREEN}All buckets are compliant for tested controls{RESET}\n")
 
     csv_file = write_csv(account_id, results)
-    print(f"\nCSV Report Generated: {csv_file}\n")
+
+    print(f"\nCSV report generated: {csv_file}\n")
+
 
 if __name__ == "__main__":
     main()
