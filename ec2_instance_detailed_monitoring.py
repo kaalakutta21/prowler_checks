@@ -14,35 +14,44 @@ def get_session(role_arn=None):
     if role_arn:
         base = boto3.Session()
         sts = base.client("sts")
+
         assumed = sts.assume_role(
             RoleArn=role_arn,
             RoleSessionName="ec2-monitoring-audit"
         )
+
         creds = assumed["Credentials"]
 
         return boto3.Session(
             aws_access_key_id=creds["AccessKeyId"],
             aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
+            aws_session_token=creds["SessionToken"]
         )
+
     return boto3.Session()
+
 
 def get_account_id(session):
     return session.client("sts").get_caller_identity()["Account"]
 
 # ==================================================
-# REGION DISCOVERY (PROWLER STYLE)
+# REGION DISCOVERY (SAFE)
 # ==================================================
 
 def get_active_regions(session):
+
     ec2 = session.client("ec2", region_name="us-east-1")
 
-    regions = ec2.describe_regions(AllRegions=False)["Regions"]
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
 
-    return [r["RegionName"] for r in regions]
+    return [
+        r["RegionName"]
+        for r in regions
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
 
 # ==================================================
-# CONTROL LOGIC (RUNNING INSTANCES ONLY)
+# CONTROL LOGIC
 # ==================================================
 
 def check_detailed_monitoring(session):
@@ -62,17 +71,37 @@ def check_detailed_monitoring(session):
 
             paginator = ec2.get_paginator("describe_instances")
 
-            for page in paginator.paginate(
-                Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
-            ):
+            page_iterator = paginator.paginate(
+                Filters=[
+                    {"Name": "instance-state-name", "Values": ["running"]}
+                ]
+            )
+
+        except ClientError as e:
+
+            error_code = e.response["Error"]["Code"]
+
+            if error_code in ["AuthFailure", "OptInRequired"]:
+                print(f"Skipping region {region} (not accessible)")
+                continue
+            else:
+                print(f"Unexpected region error {region}: {e}")
+                continue
+
+        try:
+            for page in page_iterator:
 
                 for reservation in page.get("Reservations", []):
+
                     for instance in reservation.get("Instances", []):
 
                         total_running += 1
 
                         instance_id = instance["InstanceId"]
-                        monitoring_state = instance["Monitoring"]["State"]
+
+                        monitoring_state = instance.get(
+                            "Monitoring", {}
+                        ).get("State", "disabled")
 
                         if monitoring_state == "enabled":
                             status = "COMPLIANT"
@@ -87,8 +116,16 @@ def check_detailed_monitoring(session):
                             "Status": status
                         })
 
-        except ClientError:
-            continue
+        except ClientError as e:
+
+            error_code = e.response["Error"]["Code"]
+
+            if error_code in ["AuthFailure", "OptInRequired"]:
+                print(f"Skipping region {region} during scan")
+                continue
+            else:
+                print(f"Unexpected pagination error {region}: {e}")
+                continue
 
     compliant = total_running - non_compliant
 
@@ -99,9 +136,11 @@ def check_detailed_monitoring(session):
 # ==================================================
 
 def write_csv(account_id, results):
+
     filename = f"ec2_detailed_monitoring_{account_id}.csv"
 
     with open(filename, "w", newline="") as f:
+
         fields = [
             "Account",
             "Region",
@@ -111,6 +150,7 @@ def write_csv(account_id, results):
         ]
 
         writer = csv.DictWriter(f, fieldnames=fields)
+
         writer.writeheader()
 
         for r in results:
@@ -126,14 +166,22 @@ def write_csv(account_id, results):
 # ==================================================
 
 def main():
+
     parser = argparse.ArgumentParser(
         description="Ensure EC2 running instances have detailed monitoring enabled"
     )
+
     parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
-    account_id = get_account_id(session)
+
+    try:
+        account_id = get_account_id(session)
+    except Exception as e:
+        print("Credential validation failed:", e)
+        return
 
     results, total_running, compliant, non_compliant = \
         check_detailed_monitoring(session)
@@ -144,6 +192,7 @@ def main():
     print("====================================================")
 
     overall_status = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
     print(f"OVERALL STATUS: {overall_status}\n")
 
     print("----------------------------------------------------")
@@ -153,7 +202,9 @@ def main():
     print("====================================================\n")
 
     csv_file = write_csv(account_id, results)
+
     print(f"CSV Report Generated: {csv_file}\n")
+
 
 if __name__ == "__main__":
     main()
