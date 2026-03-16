@@ -64,7 +64,20 @@ ESCALATION_ACTIONS = {
 
 def contains_escalation(policy_doc):
 
-    for stmt in policy_doc.get("Statement", []):
+    # Fix for string policies
+    if isinstance(policy_doc, str):
+        try:
+            policy_doc = json.loads(policy_doc)
+        except Exception:
+            return False
+
+    statements = policy_doc.get("Statement", [])
+
+    # AWS sometimes returns single statement dict
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    for stmt in statements:
 
         if stmt.get("Effect") != "Allow":
             continue
@@ -99,109 +112,120 @@ def check_inline_escalation(session):
     total_checked = 0
     non_compliant = 0
 
+    print("\nScanning IAM Inline Policies\n")
+
     # ================= USERS =================
 
     paginator = iam.get_paginator("list_users")
 
+    users = []
+
     for page in paginator.paginate():
+        users.extend(page["Users"])
 
-        for user in tqdm(page["Users"], desc="Users", leave=False):
+    for user in tqdm(users, desc="Users"):
 
-            user_name = user["UserName"]
+        user_name = user["UserName"]
 
-            policies = iam.list_user_policies(UserName=user_name)["PolicyNames"]
+        policies = iam.list_user_policies(UserName=user_name)["PolicyNames"]
 
-            for pol in policies:
+        for pol in policies:
 
-                total_checked += 1
+            total_checked += 1
 
-                doc = iam.get_user_policy(
-                    UserName=user_name,
-                    PolicyName=pol
-                )["PolicyDocument"]
+            doc = iam.get_user_policy(
+                UserName=user_name,
+                PolicyName=pol
+            )["PolicyDocument"]
 
-                status = "COMPLIANT"
+            status = "COMPLIANT"
 
-                if contains_escalation(doc):
-                    status = "NON_COMPLIANT"
-                    non_compliant += 1
+            if contains_escalation(doc):
+                status = "NON_COMPLIANT"
+                non_compliant += 1
 
-                results.append({
-                    "EntityType": "User",
-                    "EntityName": user_name,
-                    "PolicyName": pol,
-                    "Status": status
-                })
+            results.append({
+                "EntityType": "User",
+                "EntityName": user_name,
+                "PolicyName": pol,
+                "Status": status
+            })
 
 
     # ================= ROLES =================
 
     paginator = iam.get_paginator("list_roles")
 
+    roles = []
+
     for page in paginator.paginate():
+        roles.extend(page["Roles"])
 
-        for role in tqdm(page["Roles"], desc="Roles", leave=False):
+    for role in tqdm(roles, desc="Roles"):
 
-            role_name = role["RoleName"]
+        role_name = role["RoleName"]
 
-            policies = iam.list_role_policies(RoleName=role_name)["PolicyNames"]
+        policies = iam.list_role_policies(RoleName=role_name)["PolicyNames"]
 
-            for pol in policies:
+        for pol in policies:
 
-                total_checked += 1
+            total_checked += 1
 
-                doc = iam.get_role_policy(
-                    RoleName=role_name,
-                    PolicyName=pol
-                )["PolicyDocument"]
+            doc = iam.get_role_policy(
+                RoleName=role_name,
+                PolicyName=pol
+            )["PolicyDocument"]
 
-                status = "COMPLIANT"
+            status = "COMPLIANT"
 
-                if contains_escalation(doc):
-                    status = "NON_COMPLIANT"
-                    non_compliant += 1
+            if contains_escalation(doc):
+                status = "NON_COMPLIANT"
+                non_compliant += 1
 
-                results.append({
-                    "EntityType": "Role",
-                    "EntityName": role_name,
-                    "PolicyName": pol,
-                    "Status": status
-                })
+            results.append({
+                "EntityType": "Role",
+                "EntityName": role_name,
+                "PolicyName": pol,
+                "Status": status
+            })
 
 
     # ================= GROUPS =================
 
     paginator = iam.get_paginator("list_groups")
 
+    groups = []
+
     for page in paginator.paginate():
+        groups.extend(page["Groups"])
 
-        for grp in tqdm(page["Groups"], desc="Groups", leave=False):
+    for grp in tqdm(groups, desc="Groups"):
 
-            group_name = grp["GroupName"]
+        group_name = grp["GroupName"]
 
-            policies = iam.list_group_policies(GroupName=group_name)["PolicyNames"]
+        policies = iam.list_group_policies(GroupName=group_name)["PolicyNames"]
 
-            for pol in policies:
+        for pol in policies:
 
-                total_checked += 1
+            total_checked += 1
 
-                doc = iam.get_group_policy(
-                    GroupName=group_name,
-                    PolicyName=pol
-                )["PolicyDocument"]
+            doc = iam.get_group_policy(
+                GroupName=group_name,
+                PolicyName=pol
+            )["PolicyDocument"]
 
-                status = "COMPLIANT"
+            status = "COMPLIANT"
 
-                if contains_escalation(doc):
-                    status = "NON_COMPLIANT"
-                    non_compliant += 1
+            if contains_escalation(doc):
+                status = "NON_COMPLIANT"
+                non_compliant += 1
 
-                results.append({
-                    "EntityType": "Group",
-                    "EntityName": group_name,
-                    "PolicyName": pol,
-                    "Status": status
-                })
+            results.append({
+                "EntityType": "Group",
+                "EntityName": group_name,
+                "PolicyName": pol,
+                "Status": status
+            })
 
 
     compliant = total_checked - non_compliant
@@ -250,7 +274,7 @@ def main():
         description="Ensure IAM inline policies do not allow privilege escalation"
     )
 
-    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+    parser.add_argument("-R","--role-arn",help="Role ARN to assume")
 
     args = parser.parse_args()
 
