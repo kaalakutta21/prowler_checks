@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="sg-high-risk-port-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGION DISCOVERY
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# HIGH RISK PORTS
+# ==================================================
+
+HIGH_RISK_PORTS = {
+    21,22,23,25,53,80,110,143,445,1433,1521,2049,
+    2181,2375,2376,2483,2484,3000,3306,3389,4444,
+    5000,5432,5601,6379,6667,7001,7002,8080,8081,
+    8443,9000,9200,27017
+}
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_high_risk_sg_ports(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total_checked = 0
+    non_compliant = 0
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+
+            ec2 = session.client("ec2", region_name=region)
+
+            paginator = ec2.get_paginator("describe_security_groups")
+
+            pages = paginator.paginate()
+
+        except ClientError as e:
+
+            code = e.response["Error"]["Code"]
+
+            if code in ["AuthFailure","OptInRequired","InvalidClientTokenId"]:
+                print(f"Skipping region {region}")
+                continue
+            else:
+                continue
+
+
+        for page in pages:
+
+            for sg in page["SecurityGroups"]:
+
+                sg_id = sg["GroupId"]
+                sg_name = sg.get("GroupName","")
+
+                status = "COMPLIANT"
+                finding = ""
+
+                for rule in sg.get("IpPermissions",[]):
+
+                    from_port = rule.get("FromPort")
+                    to_port = rule.get("ToPort")
+
+                    if from_port is None:
+                        continue
+
+                    for port in range(from_port, to_port+1):
+
+                        if port not in HIGH_RISK_PORTS:
+                            continue
+
+                        # IPv4
+                        for ip in rule.get("IpRanges",[]):
+                            if ip["CidrIp"] == "0.0.0.0/0":
+                                status = "NON_COMPLIANT"
+                                finding = f"Port {port} open to 0.0.0.0/0"
+
+                        # IPv6
+                        for ip in rule.get("Ipv6Ranges",[]):
+                            if ip["CidrIpv6"] == "::/0":
+                                status = "NON_COMPLIANT"
+                                finding = f"Port {port} open to ::/0"
+
+                total_checked += 1
+
+                if status == "NON_COMPLIANT":
+                    non_compliant += 1
+
+                results.append({
+                    "Region": region,
+                    "SecurityGroupId": sg_id,
+                    "SecurityGroupName": sg_name,
+                    "Finding": finding,
+                    "Status": status
+                })
+
+
+    compliant = total_checked - non_compliant
+
+    return results,total_checked,compliant,non_compliant
+
+
+# ==================================================
+# CSV OUTPUT
+# ==================================================
+
+def write_csv(account_id,results):
+
+    filename = f"security_groups_high_risk_ports_{account_id}.csv"
+
+    with open(filename,"w",newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "SecurityGroupId",
+            "SecurityGroupName",
+            "Finding",
+            "Status"
+        ]
+
+        writer = csv.DictWriter(f,fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account":account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Ensure no security groups allow ingress from internet to high risk ports"
+    )
+
+    parser.add_argument("-R","--role-arn",help="Role ARN to assume")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    account_id = get_account_id(session)
+
+    results,total_checked,compliant,non_compliant = \
+        check_high_risk_sg_ports(session)
+
+    print("\n====================================================")
+    print("CONTROL: Security Groups High Risk Ports Exposure")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"OVERALL STATUS: {overall}\n")
+
+    print("----------------------------------------------------")
+    print(f"Total Security Groups Checked : {total_checked}")
+    print(f"Compliant                     : {compliant}")
+    print(f"Non-Compliant                 : {non_compliant}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id,results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
