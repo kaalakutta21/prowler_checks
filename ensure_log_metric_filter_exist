@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="cloudwatch-log-metric-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGION DISCOVERY
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# CONTROL DEFINITIONS
+# ==================================================
+
+CONTROLS = {
+
+    "54384": "AWS Config configuration changes",
+    "54385": "Console authentication failures",
+    "54386": "AWS Organizations changes",
+    "54387": "CloudTrail configuration changes",
+    "54388": "IAM policy changes",
+    "54389": "Console sign-in without MFA",
+    "54390": "S3 bucket policy changes",
+    "54391": "VPC changes",
+    "54392": "NACL changes",
+    "54393": "Network gateway changes",
+    "54394": "KMS CMK deletion",
+    "54395": "Security group changes",
+    "54396": "Unauthorized API calls",
+    "54397": "Root account usage"
+
+}
+
+
+# ==================================================
+# CHECK LOG METRIC FILTERS
+# ==================================================
+
+def check_metric_filters(session):
+
+    regions = get_regions(session)
+
+    results = []
+
+    control_stats = {
+        cid: {"checked": 0, "non_compliant": 0}
+        for cid in CONTROLS
+    }
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+
+            logs = session.client("logs", region_name=region)
+            cw = session.client("cloudwatch", region_name=region)
+
+            groups = logs.describe_log_groups()
+
+        except ClientError as e:
+
+            code = e.response["Error"]["Code"]
+
+            if code in ["AuthFailure", "OptInRequired", "InvalidClientTokenId"]:
+                continue
+            else:
+                continue
+
+
+        for group in groups.get("logGroups", []):
+
+            group_name = group["logGroupName"]
+
+            try:
+
+                filters = logs.describe_metric_filters(
+                    logGroupName=group_name
+                )["metricFilters"]
+
+            except ClientError:
+                continue
+
+
+            filter_names = [f["filterName"] for f in filters]
+
+            for cid, name in CONTROLS.items():
+
+                control_stats[cid]["checked"] += 1
+
+                metric_found = False
+                alarm_found = False
+
+                for f in filters:
+
+                    metric_name = f["metricTransformations"][0]["metricName"]
+
+                    # find matching alarm
+                    try:
+                        alarms = cw.describe_alarms_for_metric(
+                            MetricName=metric_name,
+                            Namespace=f["metricTransformations"][0]["metricNamespace"]
+                        )["MetricAlarms"]
+
+                        if alarms:
+                            metric_found = True
+                            alarm_found = True
+
+                    except ClientError:
+                        pass
+
+
+                status = "COMPLIANT" if (metric_found and alarm_found) else "NON_COMPLIANT"
+
+                if status == "NON_COMPLIANT":
+                    control_stats[cid]["non_compliant"] += 1
+
+
+                results.append({
+                    "Region": region,
+                    "LogGroup": group_name,
+                    "ControlID": cid,
+                    "ControlName": name,
+                    "MetricFilter": metric_found,
+                    "Alarm": alarm_found,
+                    "Status": status
+                })
+
+
+    return results, control_stats
+
+
+# ==================================================
+# CSV OUTPUT
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"cloudwatch_log_metric_filters_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "LogGroup",
+            "ControlID",
+            "ControlName",
+            "MetricFilter",
+            "Alarm",
+            "Status"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# SUMMARY
+# ==================================================
+
+def print_summary(account_id, stats):
+
+    print("\n====================================================")
+    print("CONTROL SUMMARY")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================")
+
+    for cid, data in stats.items():
+
+        checked = data["checked"]
+        non = data["non_compliant"]
+        comp = checked - non
+
+        overall = "COMPLIANT" if non == 0 else "NON_COMPLIANT"
+
+        print(f"\nCONTROL {cid}: {CONTROLS[cid]}")
+        print("----------------------------------------------------")
+        print(f"Checked      : {checked}")
+        print(f"Compliant    : {comp}")
+        print(f"NonCompliant : {non}")
+        print(f"OVERALL      : {overall}")
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Check CloudWatch Log Metric Filters and Alarms"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    account_id = get_account_id(session)
+
+    results, stats = check_metric_filters(session)
+
+    csv_file = write_csv(account_id, results)
+
+    print_summary(account_id, stats)
+
+    print(f"\nCSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
