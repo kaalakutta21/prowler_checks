@@ -36,7 +36,7 @@ def get_account_id(session):
 
 
 # ==================================================
-# REGION DISCOVERY (SAFE)
+# REGION DISCOVERY
 # ==================================================
 
 def get_regions(session):
@@ -53,7 +53,7 @@ def get_regions(session):
 
 
 # ==================================================
-# ENGINE PARAMETER MAPPING
+# SSL PARAMETER MAP
 # ==================================================
 
 def get_ssl_parameter(engine):
@@ -78,17 +78,12 @@ def get_parameter_value(rds_client, group_name, param_name):
 
     paginator = rds_client.get_paginator("describe_db_parameters")
 
-    try:
+    for page in paginator.paginate(DBParameterGroupName=group_name):
 
-        for page in paginator.paginate(DBParameterGroupName=group_name):
+        for param in page.get("Parameters", []):
 
-            for param in page.get("Parameters", []):
-
-                if param["ParameterName"] == param_name:
-                    return param.get("ParameterValue")
-
-    except ClientError:
-        pass
+            if param["ParameterName"] == param_name:
+                return param.get("ParameterValue")
 
     return None
 
@@ -97,17 +92,12 @@ def get_cluster_parameter_value(rds_client, group_name, param_name):
 
     paginator = rds_client.get_paginator("describe_db_cluster_parameters")
 
-    try:
+    for page in paginator.paginate(DBClusterParameterGroupName=group_name):
 
-        for page in paginator.paginate(DBClusterParameterGroupName=group_name):
+        for param in page.get("Parameters", []):
 
-            for param in page.get("Parameters", []):
-
-                if param["ParameterName"] == param_name:
-                    return param.get("ParameterValue")
-
-    except ClientError:
-        pass
+            if param["ParameterName"] == param_name:
+                return param.get("ParameterValue")
 
     return None
 
@@ -129,6 +119,7 @@ def check_rds_ssl_enforcement(session):
     for region in tqdm(regions, desc="Scanning Regions"):
 
         try:
+
             rds = session.client("rds", region_name=region)
 
             paginator = rds.get_paginator("describe_db_instances")
@@ -139,71 +130,86 @@ def check_rds_ssl_enforcement(session):
 
             code = e.response["Error"]["Code"]
 
-            if code in ["AuthFailure", "OptInRequired"]:
-                print(f"Skipping region {region}")
+            if code in ["AuthFailure", "OptInRequired", "InvalidClientTokenId"]:
+                print(f"Skipping region {region} (not accessible)")
                 continue
             else:
                 print(f"Region error {region}: {e}")
                 continue
 
-        for page in page_iterator:
 
-            for db in page.get("DBInstances", []):
+        try:
 
-                engine = db["Engine"]
+            for page in page_iterator:
 
-                param_name, required_value = get_ssl_parameter(engine)
+                for db in page.get("DBInstances", []):
 
-                if not param_name:
-                    continue
+                    engine = db["Engine"]
 
-                total_checked += 1
+                    param_name, required_value = get_ssl_parameter(engine)
 
-                db_id = db["DBInstanceIdentifier"]
+                    if not param_name:
+                        continue
 
-                status = "NON_COMPLIANT"
+                    total_checked += 1
 
-                # ==================================================
-                # Aurora uses cluster parameter groups
-                # ==================================================
+                    db_id = db["DBInstanceIdentifier"]
 
-                if engine.startswith("aurora"):
+                    status = "NON_COMPLIANT"
 
-                    cluster_group = db.get("DBClusterParameterGroup")
+                    # Aurora uses cluster parameter groups
+                    if engine.startswith("aurora"):
 
-                    if cluster_group:
+                        cluster_group = db.get("DBClusterParameterGroup")
 
-                        value = get_cluster_parameter_value(
-                            rds, cluster_group, param_name
-                        )
+                        if cluster_group:
 
-                        if value and value.upper() == required_value:
-                            status = "COMPLIANT"
+                            value = get_cluster_parameter_value(
+                                rds, cluster_group, param_name
+                            )
 
-                else:
+                            if value and value.upper() == required_value:
+                                status = "COMPLIANT"
 
-                    for pg in db.get("DBParameterGroups", []):
+                    else:
 
-                        group_name = pg["DBParameterGroupName"]
+                        for pg in db.get("DBParameterGroups", []):
 
-                        value = get_parameter_value(
-                            rds, group_name, param_name
-                        )
+                            group_name = pg["DBParameterGroupName"]
 
-                        if value and value.upper() == required_value:
-                            status = "COMPLIANT"
-                            break
+                            value = get_parameter_value(
+                                rds, group_name, param_name
+                            )
 
-                if status == "NON_COMPLIANT":
-                    non_compliant += 1
+                            if value and value.upper() == required_value:
+                                status = "COMPLIANT"
+                                break
 
-                results.append({
-                    "Region": region,
-                    "DBInstance": db_id,
-                    "Engine": engine,
-                    "SSLParameter": param_name,
-                    "Status": status
-                })
+
+                    if status == "NON_COMPLIANT":
+                        non_compliant += 1
+
+
+                    results.append({
+                        "Region": region,
+                        "DBInstance": db_id,
+                        "Engine": engine,
+                        "SSLParameter": param_name,
+                        "Status": status
+                    })
+
+
+        except ClientError as e:
+
+            code = e.response["Error"]["Code"]
+
+            if code in ["AuthFailure", "OptInRequired", "InvalidClientTokenId"]:
+                print(f"Skipping region {region} during scan")
+                continue
+            else:
+                print(f"Pagination error {region}: {e}")
+                continue
+
 
     compliant = total_checked - non_compliant
 
