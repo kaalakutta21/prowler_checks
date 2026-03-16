@@ -5,7 +5,6 @@ import argparse
 import csv
 import json
 from tqdm import tqdm
-from botocore.exceptions import ClientError
 
 # ==================================================
 # AUTH
@@ -42,19 +41,19 @@ def get_account_id(session):
 # ==================================================
 
 ESCALATION_ACTIONS = {
-    "iam:AttachUserPolicy",
-    "iam:AttachRolePolicy",
-    "iam:AttachGroupPolicy",
-    "iam:PutUserPolicy",
-    "iam:PutRolePolicy",
-    "iam:PutGroupPolicy",
-    "iam:AddUserToGroup",
-    "iam:UpdateAssumeRolePolicy",
-    "iam:CreatePolicyVersion",
-    "iam:SetDefaultPolicyVersion",
-    "iam:PassRole",
-    "iam:CreateAccessKey",
-    "iam:UpdateLoginProfile"
+    "iam:attachuserpolicy",
+    "iam:attachrolepolicy",
+    "iam:attachgrouppolicy",
+    "iam:putuserpolicy",
+    "iam:putrolepolicy",
+    "iam:putgrouppolicy",
+    "iam:addusertogroup",
+    "iam:updateassumerolepolicy",
+    "iam:createpolicyversion",
+    "iam:setdefaultpolicyversion",
+    "iam:passrole",
+    "iam:createaccesskey",
+    "iam:updateloginprofile"
 }
 
 
@@ -64,16 +63,14 @@ ESCALATION_ACTIONS = {
 
 def contains_escalation(policy_doc):
 
-    # Fix for string policies
     if isinstance(policy_doc, str):
         try:
             policy_doc = json.loads(policy_doc)
-        except Exception:
+        except:
             return False
 
     statements = policy_doc.get("Statement", [])
 
-    # AWS sometimes returns single statement dict
     if isinstance(statements, dict):
         statements = [statements]
 
@@ -94,7 +91,7 @@ def contains_escalation(policy_doc):
             if act == "*" or act == "iam:*":
                 return True
 
-            if act in [x.lower() for x in ESCALATION_ACTIONS]:
+            if act in ESCALATION_ACTIONS:
                 return True
 
     return False
@@ -112,13 +109,15 @@ def check_inline_escalation(session):
     total_checked = 0
     non_compliant = 0
 
+    account_id = get_account_id(session)
+
     print("\nScanning IAM Inline Policies\n")
 
     # ================= USERS =================
 
-    paginator = iam.get_paginator("list_users")
-
     users = []
+
+    paginator = iam.get_paginator("list_users")
 
     for page in paginator.paginate():
         users.extend(page["Users"])
@@ -126,6 +125,8 @@ def check_inline_escalation(session):
     for user in tqdm(users, desc="Users"):
 
         user_name = user["UserName"]
+
+        user_arn = f"arn:aws:iam::{account_id}:user/{user_name}"
 
         policies = iam.list_user_policies(UserName=user_name)["PolicyNames"]
 
@@ -145,8 +146,8 @@ def check_inline_escalation(session):
                 non_compliant += 1
 
             results.append({
+                "ResourceARN": user_arn,
                 "EntityType": "User",
-                "EntityName": user_name,
                 "PolicyName": pol,
                 "Status": status
             })
@@ -154,9 +155,9 @@ def check_inline_escalation(session):
 
     # ================= ROLES =================
 
-    paginator = iam.get_paginator("list_roles")
-
     roles = []
+
+    paginator = iam.get_paginator("list_roles")
 
     for page in paginator.paginate():
         roles.extend(page["Roles"])
@@ -164,6 +165,8 @@ def check_inline_escalation(session):
     for role in tqdm(roles, desc="Roles"):
 
         role_name = role["RoleName"]
+
+        role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
 
         policies = iam.list_role_policies(RoleName=role_name)["PolicyNames"]
 
@@ -183,8 +186,8 @@ def check_inline_escalation(session):
                 non_compliant += 1
 
             results.append({
+                "ResourceARN": role_arn,
                 "EntityType": "Role",
-                "EntityName": role_name,
                 "PolicyName": pol,
                 "Status": status
             })
@@ -192,9 +195,9 @@ def check_inline_escalation(session):
 
     # ================= GROUPS =================
 
-    paginator = iam.get_paginator("list_groups")
-
     groups = []
+
+    paginator = iam.get_paginator("list_groups")
 
     for page in paginator.paginate():
         groups.extend(page["Groups"])
@@ -202,6 +205,8 @@ def check_inline_escalation(session):
     for grp in tqdm(groups, desc="Groups"):
 
         group_name = grp["GroupName"]
+
+        group_arn = f"arn:aws:iam::{account_id}:group/{group_name}"
 
         policies = iam.list_group_policies(GroupName=group_name)["PolicyNames"]
 
@@ -221,8 +226,8 @@ def check_inline_escalation(session):
                 non_compliant += 1
 
             results.append({
+                "ResourceARN": group_arn,
                 "EntityType": "Group",
-                "EntityName": group_name,
                 "PolicyName": pol,
                 "Status": status
             })
@@ -245,8 +250,8 @@ def write_csv(account_id, results):
 
         fields = [
             "Account",
+            "ResourceARN",
             "EntityType",
-            "EntityName",
             "PolicyName",
             "Status"
         ]
