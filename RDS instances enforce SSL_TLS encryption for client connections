@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="rds-ssl-enforcement-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGION DISCOVERY (SAFE)
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# ENGINE PARAMETER MAPPING
+# ==================================================
+
+def get_ssl_parameter(engine):
+
+    if engine in ["mysql", "mariadb", "aurora-mysql"]:
+        return "require_secure_transport", "ON"
+
+    if engine in ["postgres", "aurora-postgresql"]:
+        return "rds.force_ssl", "1"
+
+    if engine.startswith("sqlserver"):
+        return "rds.force_ssl", "1"
+
+    return None, None
+
+
+# ==================================================
+# PARAMETER FETCH
+# ==================================================
+
+def get_parameter_value(rds_client, group_name, param_name):
+
+    paginator = rds_client.get_paginator("describe_db_parameters")
+
+    try:
+
+        for page in paginator.paginate(DBParameterGroupName=group_name):
+
+            for param in page.get("Parameters", []):
+
+                if param["ParameterName"] == param_name:
+                    return param.get("ParameterValue")
+
+    except ClientError:
+        pass
+
+    return None
+
+
+def get_cluster_parameter_value(rds_client, group_name, param_name):
+
+    paginator = rds_client.get_paginator("describe_db_cluster_parameters")
+
+    try:
+
+        for page in paginator.paginate(DBClusterParameterGroupName=group_name):
+
+            for param in page.get("Parameters", []):
+
+                if param["ParameterName"] == param_name:
+                    return param.get("ParameterValue")
+
+    except ClientError:
+        pass
+
+    return None
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_rds_ssl_enforcement(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total_checked = 0
+    non_compliant = 0
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+            rds = session.client("rds", region_name=region)
+
+            paginator = rds.get_paginator("describe_db_instances")
+
+            page_iterator = paginator.paginate()
+
+        except ClientError as e:
+
+            code = e.response["Error"]["Code"]
+
+            if code in ["AuthFailure", "OptInRequired"]:
+                print(f"Skipping region {region}")
+                continue
+            else:
+                print(f"Region error {region}: {e}")
+                continue
+
+        for page in page_iterator:
+
+            for db in page.get("DBInstances", []):
+
+                engine = db["Engine"]
+
+                param_name, required_value = get_ssl_parameter(engine)
+
+                if not param_name:
+                    continue
+
+                total_checked += 1
+
+                db_id = db["DBInstanceIdentifier"]
+
+                status = "NON_COMPLIANT"
+
+                # ==================================================
+                # Aurora uses cluster parameter groups
+                # ==================================================
+
+                if engine.startswith("aurora"):
+
+                    cluster_group = db.get("DBClusterParameterGroup")
+
+                    if cluster_group:
+
+                        value = get_cluster_parameter_value(
+                            rds, cluster_group, param_name
+                        )
+
+                        if value and value.upper() == required_value:
+                            status = "COMPLIANT"
+
+                else:
+
+                    for pg in db.get("DBParameterGroups", []):
+
+                        group_name = pg["DBParameterGroupName"]
+
+                        value = get_parameter_value(
+                            rds, group_name, param_name
+                        )
+
+                        if value and value.upper() == required_value:
+                            status = "COMPLIANT"
+                            break
+
+                if status == "NON_COMPLIANT":
+                    non_compliant += 1
+
+                results.append({
+                    "Region": region,
+                    "DBInstance": db_id,
+                    "Engine": engine,
+                    "SSLParameter": param_name,
+                    "Status": status
+                })
+
+    compliant = total_checked - non_compliant
+
+    return results, total_checked, compliant, non_compliant
+
+
+# ==================================================
+# CSV OUTPUT
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"rds_ssl_enforcement_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "DBInstance",
+            "Engine",
+            "SSLParameter",
+            "Status"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Ensure RDS instances enforce SSL/TLS encryption"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    try:
+        account_id = get_account_id(session)
+    except Exception as e:
+        print("Credential validation failed:", e)
+        return
+
+    results, total_checked, compliant, non_compliant = \
+        check_rds_ssl_enforcement(session)
+
+    print("\n====================================================")
+    print("CONTROL: RDS Enforce SSL/TLS Encryption")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================")
+
+    overall_status = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"OVERALL STATUS: {overall_status}\n")
+
+    print("----------------------------------------------------")
+    print(f"Total DB Instances Checked : {total_checked}")
+    print(f"Compliant                  : {compliant}")
+    print(f"Non-Compliant              : {non_compliant}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
