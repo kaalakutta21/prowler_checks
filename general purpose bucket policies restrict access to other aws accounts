@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+import json
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="s3-cross-account-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# POLICY CHECK
+# ==================================================
+
+def policy_allows_cross_account(policy, account_id):
+
+    for stmt in policy.get("Statement", []):
+
+        if stmt.get("Effect") != "Allow":
+            continue
+
+        principal = stmt.get("Principal")
+
+        if principal == "*":
+            return True
+
+        if isinstance(principal, dict) and "AWS" in principal:
+
+            aws_principal = principal["AWS"]
+
+            if isinstance(aws_principal, str):
+                aws_principal = [aws_principal]
+
+            for p in aws_principal:
+
+                if account_id not in p:
+                    return True
+
+    return False
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_bucket_policy_cross_account(session, account_id):
+
+    s3 = session.client("s3")
+
+    try:
+        buckets = s3.list_buckets()["Buckets"]
+    except ClientError as e:
+        print("Failed to list buckets:", e)
+        return [], 0, 0, 0
+
+    results = []
+    non_compliant = 0
+    total_checked = 0
+
+    print(f"\nBuckets to Scan: {len(buckets)}\n")
+
+    for bucket in tqdm(buckets, desc="Scanning Buckets"):
+
+        bucket_name = bucket["Name"]
+
+        status = "COMPLIANT"
+        reason = "No cross-account access detected"
+
+        try:
+            policy = s3.get_bucket_policy(Bucket=bucket_name)
+            policy_json = json.loads(policy["Policy"])
+
+            if policy_allows_cross_account(policy_json, account_id):
+                status = "NON_COMPLIANT"
+                reason = "Policy allows cross-account access"
+
+        except ClientError as e:
+
+            error_code = e.response["Error"]["Code"]
+
+            if error_code == "NoSuchBucketPolicy":
+                status = "COMPLIANT"
+                reason = "No bucket policy"
+
+            else:
+                continue
+
+        total_checked += 1
+
+        if status == "NON_COMPLIANT":
+            non_compliant += 1
+
+        results.append({
+            "BucketName": bucket_name,
+            "Status": status,
+            "Reason": reason
+        })
+
+    compliant = total_checked - non_compliant
+
+    return results, total_checked, compliant, non_compliant
+
+
+# ==================================================
+# CSV OUTPUT
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"s3_bucket_cross_account_policy_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "BucketName",
+            "Status",
+            "Reason"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Ensure S3 bucket policies restrict access to other AWS accounts"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    try:
+        account_id = get_account_id(session)
+    except Exception as e:
+        print("Credential validation failed:", e)
+        return
+
+    results, total_checked, compliant, non_compliant = \
+        check_bucket_policy_cross_account(session, account_id)
+
+    print("\n====================================================")
+    print("CONTROL: S3 Bucket Policies Restrict Cross Account Access")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================")
+
+    overall_status = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"OVERALL STATUS: {overall_status}\n")
+
+    print("----------------------------------------------------")
+    print(f"Total Buckets Checked : {total_checked}")
+    print(f"Compliant             : {compliant}")
+    print(f"Non-Compliant         : {non_compliant}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
