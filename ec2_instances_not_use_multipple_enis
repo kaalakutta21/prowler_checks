@@ -44,17 +44,13 @@ def get_regions(session):
 
     ec2 = session.client("ec2", region_name="us-east-1")
 
-    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+    regions = ec2.describe_regions(AllRegions=False)["Regions"]
 
-    return [
-        r["RegionName"]
-        for r in regions
-        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
-    ]
+    return [r["RegionName"] for r in regions]
 
 
 # ==================================================
-# CONTROL LOGIC
+# CONTROL LOGIC (OPTIMIZED)
 # ==================================================
 
 def check_multiple_enis(session):
@@ -65,6 +61,8 @@ def check_multiple_enis(session):
     total_checked = 0
     non_compliant = 0
 
+    account_id = get_account_id(session)
+
     print(f"\nRegions to Scan: {len(regions)}\n")
 
     for region in tqdm(regions, desc="Scanning Regions"):
@@ -74,51 +72,54 @@ def check_multiple_enis(session):
 
             paginator = ec2.get_paginator("describe_instances")
 
-            pages = paginator.paginate()
+            pages = paginator.paginate(
+                Filters=[
+                    {
+                        "Name": "instance-state-name",
+                        "Values": ["pending", "running", "stopping", "stopped"]
+                    }
+                ]
+            )
 
         except ClientError as e:
 
             code = e.response["Error"]["Code"]
 
             if code in ["AuthFailure","OptInRequired","InvalidClientTokenId"]:
-                print(f"Skipping region {region}")
                 continue
             else:
                 continue
 
 
-        try:
+        for page in pages:
 
-            for page in pages:
+            reservations = page.get("Reservations", [])
 
-                for reservation in page.get("Reservations", []):
+            for res in reservations:
 
-                    for instance in reservation.get("Instances", []):
+                for instance in res.get("Instances", []):
 
-                        total_checked += 1
+                    total_checked += 1
 
-                        instance_id = instance["InstanceId"]
+                    instance_id = instance["InstanceId"]
 
-                        eni_count = len(instance.get("NetworkInterfaces", []))
+                    eni_count = len(instance.get("NetworkInterfaces", []))
 
-                        arn = f"arn:aws:ec2:{region}:{get_account_id(session)}:instance/{instance_id}"
+                    arn = f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}"
 
-                        status = "COMPLIANT"
+                    status = "COMPLIANT"
 
-                        if eni_count > 1:
-                            status = "NON_COMPLIANT"
-                            non_compliant += 1
+                    if eni_count > 1:
+                        status = "NON_COMPLIANT"
+                        non_compliant += 1
 
-                        results.append({
-                            "Region": region,
-                            "InstanceId": instance_id,
-                            "InstanceArn": arn,
-                            "ENICount": eni_count,
-                            "Status": status
-                        })
-
-        except ClientError:
-            continue
+                    results.append({
+                        "Region": region,
+                        "InstanceId": instance_id,
+                        "InstanceArn": arn,
+                        "ENICount": eni_count,
+                        "Status": status
+                    })
 
 
     compliant = total_checked - non_compliant
