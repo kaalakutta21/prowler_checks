@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="rds-events-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_rds_event_subscriptions(session):
+
+    regions = get_regions(session)
+
+    results = []
+
+    instance_total = 0
+    instance_non = 0
+
+    param_total = 0
+    param_non = 0
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+            rds = session.client("rds", region_name=region)
+
+            instances = rds.describe_db_instances()["DBInstances"]
+            param_groups = rds.describe_db_parameter_groups()["DBParameterGroups"]
+            subs = rds.describe_event_subscriptions()["EventSubscriptionsList"]
+
+        except ClientError as e:
+
+            code = e.response["Error"]["Code"]
+
+            if code in ["AuthFailure","OptInRequired","InvalidClientTokenId"]:
+                print(f"Skipping region {region}")
+                continue
+            else:
+                continue
+
+
+        # ================= INSTANCE EVENTS =================
+
+        for db in instances:
+
+            instance_total += 1
+
+            db_id = db["DBInstanceIdentifier"]
+            arn = db.get("DBInstanceArn", "")
+
+            status = "NON_COMPLIANT"
+            finding = "No valid subscription"
+
+            for sub in subs:
+
+                if not sub.get("Enabled"):
+                    continue
+
+                if sub.get("SourceType") != "db-instance":
+                    continue
+
+                sources = sub.get("SourceIdsList", [])
+
+                if not sources or db_id in sources:
+                    status = "COMPLIANT"
+                    finding = "Subscription exists"
+                    break
+
+            if status == "NON_COMPLIANT":
+                instance_non += 1
+
+            results.append({
+                "Control": "RDS Instance Events Subscribed",
+                "Region": region,
+                "ResourceId": db_id,
+                "ResourceArn": arn,
+                "Status": status
+            })
+
+
+        # ================= PARAMETER GROUP EVENTS =================
+
+        for pg in param_groups:
+
+            param_total += 1
+
+            pg_name = pg["DBParameterGroupName"]
+            arn = f"arn:aws:rds:{region}:{get_account_id(session)}:pg:{pg_name}"
+
+            status = "NON_COMPLIANT"
+            finding = "No valid subscription"
+
+            for sub in subs:
+
+                if not sub.get("Enabled"):
+                    continue
+
+                if sub.get("SourceType") != "db-parameter-group":
+                    continue
+
+                sources = sub.get("SourceIdsList", [])
+
+                if not sources or pg_name in sources:
+                    status = "COMPLIANT"
+                    finding = "Subscription exists"
+                    break
+
+            if status == "NON_COMPLIANT":
+                param_non += 1
+
+            results.append({
+                "Control": "RDS Parameter Group Events Subscribed",
+                "Region": region,
+                "ResourceId": pg_name,
+                "ResourceArn": arn,
+                "Status": status
+            })
+
+
+    instance_comp = instance_total - instance_non
+    param_comp = param_total - param_non
+
+    return results, instance_total, instance_comp, instance_non, param_total, param_comp, param_non
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"rds_event_subscriptions_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Control",
+            "Region",
+            "ResourceId",
+            "ResourceArn",
+            "Status"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Check RDS instance & parameter group event subscriptions"
+    )
+
+    parser.add_argument("-R","--role-arn",help="Role ARN to assume")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    account_id = get_account_id(session)
+
+    (
+        results,
+        inst_total, inst_comp, inst_non,
+        pg_total, pg_comp, pg_non
+    ) = check_rds_event_subscriptions(session)
+
+    print("\n====================================================")
+    print("CONTROL: RDS EVENT SUBSCRIPTIONS")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    # -------- Instance Summary --------
+    print("RDS Instance Events")
+    print("----------------------------------")
+    print(f"Total     : {inst_total}")
+    print(f"Compliant : {inst_comp}")
+    print(f"Non-Compliant : {inst_non}")
+    print("----------------------------------\n")
+
+    # -------- Parameter Group Summary --------
+    print("RDS Parameter Group Events")
+    print("----------------------------------")
+    print(f"Total     : {pg_total}")
+    print(f"Compliant : {pg_comp}")
+    print(f"Non-Compliant : {pg_non}")
+    print("============================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
