@@ -83,25 +83,25 @@ def check_trusted_advisor(session):
         except ClientError:
             continue
 
-        status = result.get("status", "ok")
+        ta_status = result.get("status", "ok")
 
         total_checked += 1
 
         final_status = "COMPLIANT"
 
-        if status in ["warning", "error"]:
+        if ta_status in ["warning", "error"]:
             final_status = "NON_COMPLIANT"
             non_compliant += 1
 
-        # ARN-style identifier
-        arn = f"arn:aws:support::{account_id}:trusted-advisor-check/{check_id}"
+        # ✅ Prowler-style ARN
+        arn = f"arn:aws:trusted_advisor:us-east-1:{account_id}:check/{check_id}"
 
         results.append({
             "CheckId": check_id,
             "CheckArn": arn,
             "CheckName": check_name,
             "Category": category,
-            "TAStatus": status,
+            "TAStatus": ta_status,
             "Status": final_status
         })
 
