@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+import ipaddress
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="sg-wide-open-cidr-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    return [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+
+
+# ==================================================
+# CIDR CHECK
+# ==================================================
+
+def is_wide_open(cidr):
+
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+        return network.prefixlen <= 24
+    except Exception:
+        return False
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_security_groups(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total_checked = 0
+    non_compliant = 0
+
+    account_id = get_account_id(session)
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        # ---------- CLIENT ----------
+        try:
+            ec2 = session.client("ec2", region_name=region)
+        except ClientError:
+            continue
+
+        # ---------- PAGINATOR ----------
+        try:
+            paginator = ec2.get_paginator("describe_security_groups")
+            pages = paginator.paginate()
+        except ClientError:
+            continue
+
+        # ---------- ITERATION ----------
+        try:
+
+            for page in pages:
+
+                for sg in page.get("SecurityGroups", []):
+
+                    sg_id = sg["GroupId"]
+                    sg_name = sg.get("GroupName", "")
+
+                    arn = f"arn:aws:ec2:{region}:{account_id}:security-group/{sg_id}"
+
+                    flagged = False
+
+                    # -------- INGRESS --------
+                    for perm in sg.get("IpPermissions", []):
+
+                        for ip_range in perm.get("IpRanges", []):
+                            cidr = ip_range.get("CidrIp")
+
+                            if cidr and is_wide_open(cidr):
+                                flagged = True
+
+                        for ip_range in perm.get("Ipv6Ranges", []):
+                            cidr = ip_range.get("CidrIpv6")
+
+                            if cidr and is_wide_open(cidr):
+                                flagged = True
+
+                    # -------- EGRESS --------
+                    for perm in sg.get("IpPermissionsEgress", []):
+
+                        for ip_range in perm.get("IpRanges", []):
+                            cidr = ip_range.get("CidrIp")
+
+                            if cidr and is_wide_open(cidr):
+                                flagged = True
+
+                        for ip_range in perm.get("Ipv6Ranges", []):
+                            cidr = ip_range.get("CidrIpv6")
+
+                            if cidr and is_wide_open(cidr):
+                                flagged = True
+
+                    total_checked += 1
+
+                    status = "COMPLIANT"
+
+                    if flagged:
+                        status = "NON_COMPLIANT"
+                        non_compliant += 1
+
+                    results.append({
+                        "Region": region,
+                        "SecurityGroupId": sg_id,
+                        "SecurityGroupName": sg_name,
+                        "SecurityGroupArn": arn,
+                        "WideOpenCIDR": flagged,
+                        "Status": status
+                    })
+
+        except ClientError:
+            continue
+
+
+    compliant = total_checked - non_compliant
+
+    return results, total_checked, compliant, non_compliant
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"sg_wide_open_cidr_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "SecurityGroupId",
+            "SecurityGroupName",
+            "SecurityGroupArn",
+            "WideOpenCIDR",
+            "Status"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Ensure SGs do not allow wide open CIDR ranges (/0 to /24)"
+    )
+
+    parser.add_argument("-R","--role-arn",help="Role ARN to assume")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    account_id = get_account_id(session)
+
+    results,total_checked,compliant,non_compliant = \
+        check_security_groups(session)
+
+    print("\n====================================================")
+    print("CONTROL: Security Groups Wide CIDR Exposure (/0 - /24)")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"OVERALL STATUS: {overall}\n")
+
+    print("----------------------------------------------------")
+    print(f"Total Security Groups Checked : {total_checked}")
+    print(f"Compliant                     : {compliant}")
+    print(f"Non-Compliant                 : {non_compliant}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id,results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
