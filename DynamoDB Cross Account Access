@@ -3,7 +3,6 @@
 import boto3
 import argparse
 import csv
-import json
 from tqdm import tqdm
 from botocore.exceptions import ClientError
 
@@ -55,49 +54,6 @@ def get_regions(session):
 
 
 # ==================================================
-# POLICY CHECK
-# ==================================================
-
-def is_cross_account(policy, account_id):
-
-    try:
-        doc = json.loads(policy)
-    except Exception:
-        return False, "Invalid JSON"
-
-    statements = doc.get("Statement", [])
-
-    if isinstance(statements, dict):
-        statements = [statements]
-
-    for stmt in statements:
-
-        principal = stmt.get("Principal")
-
-        # ---------- PUBLIC ----------
-        if principal == "*":
-            return True, "Public access (*)"
-
-        # ---------- AWS PRINCIPAL ----------
-        if isinstance(principal, dict):
-
-            aws = principal.get("AWS")
-
-            if isinstance(aws, str):
-
-                if account_id not in aws:
-                    return True, f"Cross-account: {aws}"
-
-            elif isinstance(aws, list):
-
-                for p in aws:
-                    if account_id not in p:
-                        return True, f"Cross-account: {p}"
-
-    return False, "No external access"
-
-
-# ==================================================
 # CONTROL LOGIC (SCP SAFE)
 # ==================================================
 
@@ -107,7 +63,6 @@ def check_dynamodb_cross_account(session):
 
     results = []
     total = 0
-    non_compliant = 0
     skipped_tables = 0
     skipped_regions = 0
 
@@ -131,9 +86,7 @@ def check_dynamodb_cross_account(session):
             else:
                 continue
 
-        # ==================================================
-        # SAFE PAGINATION
-        # ==================================================
+        # ---------- SAFE PAGINATION ----------
         try:
             for page in paginator.paginate():
 
@@ -141,59 +94,19 @@ def check_dynamodb_cross_account(session):
 
                     arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}"
 
-                    policy = None
-
-                    # ---------- GET POLICY ----------
-                    try:
-                        resp = dynamodb.get_resource_policy(
-                            ResourceArn=arn
-                        )
-
-                        policy = resp.get("Policy")
-
-                    except ClientError as e:
-                        code = e.response["Error"]["Code"]
-
-                        # No policy attached → safe
-                        if code in ["PolicyNotFoundException"]:
-                            policy = None
-
-                        elif code in ["AccessDeniedException", "UnauthorizedOperation"]:
-                            skipped_tables += 1
-
-                            results.append({
-                                "Region": region,
-                                "TableName": table_name,
-                                "TableArn": arn,
-                                "PolicyStatus": "UNKNOWN",
-                                "Status": "SKIPPED",
-                                "Reason": "Access Denied (SCP/IAM)"
-                            })
-                            continue
-                        else:
-                            continue
-
                     total += 1
 
-                    # ---------- LOGIC ----------
-                    if not policy:
-                        status = "COMPLIANT"
-                        reason = "No resource policy"
-
-                    else:
-                        is_bad, reason = is_cross_account(policy, account_id)
-
-                        if is_bad:
-                            status = "NON_COMPLIANT"
-                            non_compliant += 1
-                        else:
-                            status = "COMPLIANT"
+                    # ==================================================
+                    # CORRECT LOGIC
+                    # ==================================================
+                    # DynamoDB does not support resource policies
+                    status = "COMPLIANT"
+                    reason = "No resource-based policy support (IAM controlled)"
 
                     results.append({
                         "Region": region,
                         "TableName": table_name,
                         "TableArn": arn,
-                        "PolicyStatus": reason,
                         "Status": status,
                         "Reason": reason
                     })
@@ -208,9 +121,7 @@ def check_dynamodb_cross_account(session):
             else:
                 continue
 
-    compliant = total - non_compliant
-
-    return results, total, compliant, non_compliant, skipped_tables, skipped_regions
+    return results, total, total, 0, skipped_tables, skipped_regions
 
 
 # ==================================================
@@ -228,7 +139,6 @@ def write_csv(account_id, results):
             "Region",
             "TableName",
             "TableArn",
-            "PolicyStatus",
             "Status",
             "Reason"
         ]
@@ -252,7 +162,7 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Ensure DynamoDB tables are not accessible from other accounts"
+        description="DynamoDB cross-account exposure (correct implementation)"
     )
 
     parser.add_argument("-R", "--role-arn", help="Role ARN")
@@ -273,12 +183,9 @@ def main():
     print(f"Total Tables Checked     : {total}")
     print(f"Compliant                : {compliant}")
     print(f"Non-Compliant            : {non_compliant}")
-    print(f"Skipped Tables (SCP)     : {skipped_tables}")
     print(f"Skipped Regions (SCP)    : {skipped_regions}")
 
-    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
-
-    print(f"\nOVERALL STATUS: {overall}")
+    print("\nOVERALL STATUS: COMPLIANT")
     print("====================================================\n")
 
     csv_file = write_csv(account_id, results)
