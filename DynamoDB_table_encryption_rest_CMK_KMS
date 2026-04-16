@@ -54,7 +54,7 @@ def get_regions(session):
 
 
 # ==================================================
-# CONTROL LOGIC
+# CONTROL LOGIC (SCP SAFE)
 # ==================================================
 
 def check_dynamodb_kms(session):
@@ -64,8 +64,11 @@ def check_dynamodb_kms(session):
     results = []
     total = 0
     non_compliant = 0
+    skipped = 0
 
     account_id = get_account_id(session)
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
 
     for region in tqdm(regions, desc="Scanning Regions"):
 
@@ -75,23 +78,53 @@ def check_dynamodb_kms(session):
             paginator = dynamodb.get_paginator("list_tables")
             pages = paginator.paginate()
 
-        except ClientError:
-            continue
+        except ClientError as e:
+
+            code = e.response["Error"]["Code"]
+
+            if code in ["AuthFailure", "OptInRequired", "UnauthorizedOperation", "AccessDeniedException"]:
+                print(f"Skipping region {region} (Access Denied / SCP)")
+                skipped += 1
+                continue
+            else:
+                continue
 
         for page in pages:
 
             for table_name in page.get("TableNames", []):
 
-                total += 1
-
                 arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}"
 
+                # ==================================================
+                # DESCRIBE TABLE (MAIN FAILURE POINT)
+                # ==================================================
                 try:
                     desc = dynamodb.describe_table(
                         TableName=table_name
                     )["Table"]
-                except ClientError:
-                    continue
+
+                except ClientError as e:
+
+                    code = e.response["Error"]["Code"]
+
+                    if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                        skipped += 1
+
+                        results.append({
+                            "Region": region,
+                            "TableName": table_name,
+                            "TableArn": arn,
+                            "SSEType": "UNKNOWN",
+                            "KMSKey": "UNKNOWN",
+                            "Status": "SKIPPED",
+                            "Reason": "Access Denied (SCP/IAM)"
+                        })
+                        continue
+
+                    else:
+                        continue
+
+                total += 1
 
                 sse = desc.get("SSEDescription", {})
 
@@ -100,13 +133,13 @@ def check_dynamodb_kms(session):
                 status_flag = sse.get("SSEStatus")
 
                 # ==================================================
-                # LOGIC (PROWLER STYLE)
+                # LOGIC
                 # ==================================================
                 if (
                     sse_type == "KMS"
                     and kms_key
                     and status_flag == "ENABLED"
-                    and "alias/aws/dynamodb" not in kms_key.lower()
+                    and "alias/aws/dynamodb" not in (kms_key or "").lower()
                 ):
                     status = "COMPLIANT"
                     reason = "Customer Managed CMK"
@@ -136,7 +169,7 @@ def check_dynamodb_kms(session):
 
     compliant = total - non_compliant
 
-    return results, total, compliant, non_compliant
+    return results, total, compliant, non_compliant, skipped
 
 
 # ==================================================
@@ -179,7 +212,7 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Ensure DynamoDB tables use customer-managed KMS CMK"
+        description="Ensure DynamoDB tables use CMK encryption (SCP aware)"
     )
 
     parser.add_argument("-R", "--role-arn", help="Role ARN")
@@ -187,10 +220,9 @@ def main():
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
-
     account_id = get_account_id(session)
 
-    results, total, compliant, non_compliant = \
+    results, total, compliant, non_compliant, skipped = \
         check_dynamodb_kms(session)
 
     print("\n====================================================")
@@ -201,6 +233,7 @@ def main():
     print(f"Total Tables Checked : {total}")
     print(f"Compliant            : {compliant}")
     print(f"Non-Compliant        : {non_compliant}")
+    print(f"Skipped (Access Denied): {skipped}")
 
     overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
 
