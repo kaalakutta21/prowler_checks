@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+import json
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="sqs-public-policy-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# POLICY CHECK
+# ==================================================
+
+def is_policy_public(policy):
+
+    try:
+        doc = json.loads(policy)
+    except Exception:
+        return False, "Invalid JSON"
+
+    statements = doc.get("Statement", [])
+
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    for stmt in statements:
+
+        principal = stmt.get("Principal")
+
+        # ---------- PUBLIC ----------
+        if principal == "*" or (isinstance(principal, dict) and principal.get("AWS") == "*"):
+
+            condition = stmt.get("Condition")
+
+            # ---------- NO RESTRICTION ----------
+            if not condition:
+                return True, "Public without condition"
+
+            # ---------- HAS CONDITION ----------
+            cond_str = json.dumps(condition)
+
+            if any(x in cond_str for x in [
+                "aws:SourceArn",
+                "aws:SourceAccount",
+                "aws:PrincipalOrgID"
+            ]):
+                continue
+            else:
+                return True, "Weak condition"
+
+    return False, "Not public"
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_sqs_public(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total = 0
+    non_compliant = 0
+
+    account_id = get_account_id(session)
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+            sqs = session.client("sqs", region_name=region)
+
+            queues = sqs.list_queues().get("QueueUrls", [])
+
+        except ClientError:
+            continue
+
+        for q_url in queues:
+
+            total += 1
+
+            try:
+                attrs = sqs.get_queue_attributes(
+                    QueueUrl=q_url,
+                    AttributeNames=["Policy"]
+                )["Attributes"]
+            except ClientError:
+                continue
+
+            policy = attrs.get("Policy")
+
+            queue_name = q_url.split("/")[-1]
+
+            arn = f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+
+            if not policy:
+                status = "COMPLIANT"
+                reason = "No policy"
+            else:
+                is_public, reason = is_policy_public(policy)
+
+                if is_public:
+                    status = "NON_COMPLIANT"
+                    non_compliant += 1
+                else:
+                    status = "COMPLIANT"
+
+            results.append({
+                "Region": region,
+                "QueueName": queue_name,
+                "QueueArn": arn,
+                "PolicyStatus": reason,
+                "Status": status
+            })
+
+    compliant = total - non_compliant
+
+    return results, total, compliant, non_compliant
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"sqs_public_policy_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "QueueName",
+            "QueueArn",
+            "PolicyStatus",
+            "Status"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Ensure SQS queues are not publicly accessible"
+    )
+
+    parser.add_argument("-R","--role-arn",help="Role ARN")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+
+    account_id = get_account_id(session)
+
+    results,total,compliant,non_compliant = \
+        check_sqs_public(session)
+
+    print("\n====================================================")
+    print("CONTROL: SQS Queues Not Public")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Queues Checked : {total}")
+    print(f"Compliant            : {compliant}")
+    print(f"Non-Compliant        : {non_compliant}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
