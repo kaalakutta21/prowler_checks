@@ -38,7 +38,7 @@ def get_account_id(session):
 
 
 # ==================================================
-# REGIONS
+# REGIONS (PROWLER STYLE)
 # ==================================================
 
 def get_regions(session):
@@ -67,6 +67,7 @@ def is_policy_public(policy):
 
     statements = doc.get("Statement", [])
 
+    # Normalize to list
     if isinstance(statements, dict):
         statements = [statements]
 
@@ -74,26 +75,40 @@ def is_policy_public(policy):
 
         principal = stmt.get("Principal")
 
-        # ---------- PUBLIC ----------
-        if principal == "*" or (isinstance(principal, dict) and principal.get("AWS") == "*"):
+        # ---------- CHECK PUBLIC ----------
+        is_public = False
 
-            condition = stmt.get("Condition")
+        if principal == "*":
+            is_public = True
 
-            # ---------- NO RESTRICTION ----------
-            if not condition:
-                return True, "Public without condition"
+        elif isinstance(principal, dict):
+            aws_principal = principal.get("AWS")
 
-            # ---------- HAS CONDITION ----------
-            cond_str = json.dumps(condition)
+            if aws_principal == "*":
+                is_public = True
 
-            if any(x in cond_str for x in [
-                "aws:SourceArn",
-                "aws:SourceAccount",
-                "aws:PrincipalOrgID"
-            ]):
-                continue
-            else:
-                return True, "Weak condition"
+            elif isinstance(aws_principal, list) and "*" in aws_principal:
+                is_public = True
+
+        if not is_public:
+            continue
+
+        # ---------- CHECK CONDITIONS ----------
+        condition = stmt.get("Condition")
+
+        if not condition:
+            return True, "Public without condition"
+
+        cond_str = json.dumps(condition)
+
+        if any(x in cond_str for x in [
+            "aws:SourceArn",
+            "aws:SourceAccount",
+            "aws:PrincipalOrgID"
+        ]):
+            continue
+        else:
+            return True, "Public with weak condition"
 
     return False, "Not public"
 
@@ -117,32 +132,47 @@ def check_sqs_public(session):
         try:
             sqs = session.client("sqs", region_name=region)
 
-            queues = sqs.list_queues().get("QueueUrls", [])
+            response = sqs.list_queues()
+            queues = response.get("QueueUrls", [])
 
-        except ClientError:
-            continue
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+
+            if code in ["AuthFailure", "OptInRequired", "InvalidClientTokenId"]:
+                print(f"Skipping region {region}")
+                continue
+            else:
+                continue
 
         for q_url in queues:
 
             total += 1
 
+            queue_name = q_url.split("/")[-1]
+            arn = f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+
+            # ---------- SAFE ATTRIBUTE FETCH ----------
             try:
-                attrs = sqs.get_queue_attributes(
+                response = sqs.get_queue_attributes(
                     QueueUrl=q_url,
                     AttributeNames=["Policy"]
-                )["Attributes"]
+                )
+
+                attrs = response.get("Attributes", {})
+
+                if not isinstance(attrs, dict):
+                    attrs = {}
+
             except ClientError:
                 continue
 
             policy = attrs.get("Policy")
 
-            queue_name = q_url.split("/")[-1]
-
-            arn = f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
-
+            # ---------- EVALUATION ----------
             if not policy:
                 status = "COMPLIANT"
                 reason = "No policy"
+
             else:
                 is_public, reason = is_policy_public(policy)
 
@@ -166,7 +196,7 @@ def check_sqs_public(session):
 
 
 # ==================================================
-# CSV
+# CSV OUTPUT
 # ==================================================
 
 def write_csv(account_id, results):
@@ -207,7 +237,7 @@ def main():
         description="Ensure SQS queues are not publicly accessible"
     )
 
-    parser.add_argument("-R","--role-arn",help="Role ARN")
+    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
 
     args = parser.parse_args()
 
@@ -215,7 +245,7 @@ def main():
 
     account_id = get_account_id(session)
 
-    results,total,compliant,non_compliant = \
+    results, total, compliant, non_compliant = \
         check_sqs_public(session)
 
     print("\n====================================================")
