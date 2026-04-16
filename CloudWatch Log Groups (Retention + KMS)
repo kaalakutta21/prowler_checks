@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# CONFIG
+# ==================================================
+
+MIN_RETENTION_DAYS = 365
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="cloudwatch-loggroup-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r.get("OptInStatus") in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_log_groups(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total = 0
+    retention_fail = 0
+    kms_fail = 0
+    skipped_regions = 0
+
+    account_id = get_account_id(session)
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+            logs = session.client("logs", region_name=region)
+            paginator = logs.get_paginator("describe_log_groups")
+
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+
+            if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                print(f"Skipping region {region} (SCP Denied)")
+                skipped_regions += 1
+                continue
+            else:
+                continue
+
+        # ==================================================
+        # SAFE PAGINATION
+        # ==================================================
+        try:
+            for page in paginator.paginate():
+
+                for lg in page.get("logGroups", []):
+
+                    total += 1
+
+                    name = lg.get("logGroupName")
+                    arn = lg.get("arn", f"arn:aws:logs:{region}:{account_id}:log-group:{name}")
+
+                    retention = lg.get("retentionInDays")
+                    kms_key = lg.get("kmsKeyId")
+
+                    # ==================================================
+                    # CONTROL 1: RETENTION
+                    # ==================================================
+
+                    if retention is None:
+                        retention_status = "NON_COMPLIANT"
+                        retention_reason = "Never expires"
+                        retention_fail += 1
+
+                    elif retention < MIN_RETENTION_DAYS:
+                        retention_status = "NON_COMPLIANT"
+                        retention_reason = f"Less than {MIN_RETENTION_DAYS} days"
+                        retention_fail += 1
+
+                    else:
+                        retention_status = "COMPLIANT"
+                        retention_reason = "Retention OK"
+
+                    # ==================================================
+                    # CONTROL 2: KMS ENCRYPTION
+                    # ==================================================
+
+                    if not kms_key:
+                        kms_status = "NON_COMPLIANT"
+                        kms_reason = "No KMS encryption"
+                        kms_fail += 1
+
+                    elif "alias/aws/" in kms_key.lower():
+                        kms_status = "NON_COMPLIANT"
+                        kms_reason = "AWS managed key"
+                        kms_fail += 1
+
+                    else:
+                        kms_status = "COMPLIANT"
+                        kms_reason = "Customer managed CMK"
+
+                    results.append({
+                        "Region": region,
+                        "LogGroupName": name,
+                        "LogGroupArn": arn,
+                        "RetentionDays": retention if retention else "None",
+                        "RetentionStatus": retention_status,
+                        "RetentionReason": retention_reason,
+                        "KMSKey": kms_key if kms_key else "None",
+                        "KMSStatus": kms_status,
+                        "KMSReason": kms_reason
+                    })
+
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+
+            if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                print(f"Skipping region {region} during pagination (SCP Denied)")
+                skipped_regions += 1
+                continue
+            else:
+                continue
+
+    return results, total, retention_fail, kms_fail, skipped_regions
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"cloudwatch_loggroups_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "LogGroupName",
+            "LogGroupArn",
+            "RetentionDays",
+            "RetentionStatus",
+            "RetentionReason",
+            "KMSKey",
+            "KMSStatus",
+            "KMSReason"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="CloudWatch Log Groups Retention + KMS Audit"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total, retention_fail, kms_fail, skipped_regions = \
+        check_log_groups(session)
+
+    print("\n====================================================")
+    print("CONTROL: CloudWatch Log Groups (Retention + KMS)")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Log Groups Checked : {total}")
+    print(f"Retention Failures       : {retention_fail}")
+    print(f"KMS Failures             : {kms_fail}")
+    print(f"Skipped Regions (SCP)    : {skipped_regions}")
+
+    overall = "COMPLIANT" if retention_fail == 0 and kms_fail == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
