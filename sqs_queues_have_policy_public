@@ -38,7 +38,7 @@ def get_account_id(session):
 
 
 # ==================================================
-# REGIONS (PROWLER STYLE)
+# REGIONS
 # ==================================================
 
 def get_regions(session):
@@ -50,7 +50,7 @@ def get_regions(session):
     return [
         r["RegionName"]
         for r in regions
-        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+        if r.get("OptInStatus") in ["opt-in-not-required", "opted-in"]
     ]
 
 
@@ -67,7 +67,6 @@ def is_policy_public(policy):
 
     statements = doc.get("Statement", [])
 
-    # Normalize to list
     if isinstance(statements, dict):
         statements = [statements]
 
@@ -75,25 +74,23 @@ def is_policy_public(policy):
 
         principal = stmt.get("Principal")
 
-        # ---------- CHECK PUBLIC ----------
         is_public = False
 
         if principal == "*":
             is_public = True
 
         elif isinstance(principal, dict):
-            aws_principal = principal.get("AWS")
+            aws = principal.get("AWS")
 
-            if aws_principal == "*":
+            if aws == "*":
                 is_public = True
 
-            elif isinstance(aws_principal, list) and "*" in aws_principal:
+            elif isinstance(aws, list) and "*" in aws:
                 is_public = True
 
         if not is_public:
             continue
 
-        # ---------- CHECK CONDITIONS ----------
         condition = stmt.get("Condition")
 
         if not condition:
@@ -132,8 +129,8 @@ def check_sqs_public(session):
         try:
             sqs = session.client("sqs", region_name=region)
 
-            response = sqs.list_queues()
-            queues = response.get("QueueUrls", [])
+            resp = sqs.list_queues()
+            queues = resp.get("QueueUrls", []) if isinstance(resp, dict) else []
 
         except ClientError as e:
             code = e.response["Error"]["Code"]
@@ -151,22 +148,23 @@ def check_sqs_public(session):
             queue_name = q_url.split("/")[-1]
             arn = f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
 
-            # ---------- SAFE ATTRIBUTE FETCH ----------
+            policy = None
+
+            # ---------- HARDENED FETCH ----------
             try:
                 response = sqs.get_queue_attributes(
                     QueueUrl=q_url,
                     AttributeNames=["Policy"]
                 )
 
-                attrs = response.get("Attributes", {})
+                if isinstance(response, dict):
+                    attrs = response.get("Attributes")
 
-                if not isinstance(attrs, dict):
-                    attrs = {}
+                    if isinstance(attrs, dict):
+                        policy = attrs.get("Policy")
 
             except ClientError:
-                continue
-
-            policy = attrs.get("Policy")
+                pass
 
             # ---------- EVALUATION ----------
             if not policy:
@@ -196,7 +194,7 @@ def check_sqs_public(session):
 
 
 # ==================================================
-# CSV OUTPUT
+# CSV
 # ==================================================
 
 def write_csv(account_id, results):
@@ -215,7 +213,6 @@ def write_csv(account_id, results):
         ]
 
         writer = csv.DictWriter(f, fieldnames=fields)
-
         writer.writeheader()
 
         for r in results:
@@ -237,7 +234,7 @@ def main():
         description="Ensure SQS queues are not publicly accessible"
     )
 
-    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+    parser.add_argument("-R", "--role-arn", help="Role ARN")
 
     args = parser.parse_args()
 
