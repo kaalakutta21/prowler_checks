@@ -11,6 +11,7 @@ from botocore.exceptions import ClientError
 # ==================================================
 
 def get_session(role_arn=None):
+
     if role_arn:
         base = boto3.Session()
         sts = base.client("sts")
@@ -53,28 +54,7 @@ def get_regions(session):
 
 
 # ==================================================
-# HELPER: SCP SAFE ITERATOR
-# ==================================================
-
-def safe_paginate(paginator, skipped_regions, region):
-
-    try:
-        for page in paginator.paginate():
-            yield page
-
-    except ClientError as e:
-        code = e.response["Error"]["Code"]
-
-        if code in ["AccessDeniedException", "UnauthorizedOperation"]:
-            print(f"Skipping region {region} (SCP Denied)")
-            skipped_regions.add(region)
-            return
-        else:
-            return
-
-
-# ==================================================
-# CONTROL LOGIC
+# CONTROL LOGIC (SCP SAFE + PAGINATION FIXED)
 # ==================================================
 
 def check_dynamodb_kms(session):
@@ -84,8 +64,8 @@ def check_dynamodb_kms(session):
     results = []
     total = 0
     non_compliant = 0
-    skipped = 0
-    skipped_regions = set()
+    skipped_tables = 0
+    skipped_regions = 0
 
     account_id = get_account_id(session)
 
@@ -93,7 +73,6 @@ def check_dynamodb_kms(session):
 
     for region in tqdm(regions, desc="Scanning Regions"):
 
-        # ---------- REGION LEVEL ----------
         try:
             dynamodb = session.client("dynamodb", region_name=region)
             paginator = dynamodb.get_paginator("list_tables")
@@ -102,91 +81,101 @@ def check_dynamodb_kms(session):
             code = e.response["Error"]["Code"]
 
             if code in ["AccessDeniedException", "UnauthorizedOperation"]:
-                print(f"Skipping region {region} (Access Denied)")
-                skipped_regions.add(region)
+                print(f"Skipping region {region} (SCP Denied)")
+                skipped_regions += 1
                 continue
             else:
                 continue
 
-        # ---------- PAGINATION LEVEL ----------
-        for page in safe_paginate(paginator, skipped_regions, region):
+        # ==================================================
+        # SAFE PAGINATION (CRITICAL FIX)
+        # ==================================================
+        try:
+            for page in paginator.paginate():
 
-            if not page:
+                for table_name in page.get("TableNames", []):
+
+                    arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}"
+
+                    # ---------- DESCRIBE TABLE ----------
+                    try:
+                        desc = dynamodb.describe_table(
+                            TableName=table_name
+                        )["Table"]
+
+                    except ClientError as e:
+                        code = e.response["Error"]["Code"]
+
+                        if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                            skipped_tables += 1
+
+                            results.append({
+                                "Region": region,
+                                "TableName": table_name,
+                                "TableArn": arn,
+                                "SSEType": "UNKNOWN",
+                                "KMSKey": "UNKNOWN",
+                                "Status": "SKIPPED",
+                                "Reason": "Access Denied (SCP/IAM)"
+                            })
+                            continue
+                        else:
+                            continue
+
+                    total += 1
+
+                    sse = desc.get("SSEDescription", {})
+
+                    sse_type = sse.get("SSEType")
+                    kms_key = sse.get("KMSMasterKeyArn")
+                    status_flag = sse.get("SSEStatus")
+
+                    # ---------- LOGIC ----------
+                    if (
+                        sse_type == "KMS"
+                        and kms_key
+                        and status_flag == "ENABLED"
+                        and "alias/aws/dynamodb" not in (kms_key or "").lower()
+                    ):
+                        status = "COMPLIANT"
+                        reason = "Customer Managed CMK"
+
+                    else:
+                        status = "NON_COMPLIANT"
+                        non_compliant += 1
+
+                        if not sse:
+                            reason = "No encryption"
+                        elif not kms_key:
+                            reason = "No KMS key"
+                        elif "alias/aws/dynamodb" in (kms_key or "").lower():
+                            reason = "AWS Managed Key"
+                        else:
+                            reason = "Unknown configuration"
+
+                    results.append({
+                        "Region": region,
+                        "TableName": table_name,
+                        "TableArn": arn,
+                        "SSEType": sse_type if sse_type else "None",
+                        "KMSKey": kms_key if kms_key else "None",
+                        "Status": status,
+                        "Reason": reason
+                    })
+
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+
+            if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                print(f"Skipping region {region} during pagination (SCP Denied)")
+                skipped_regions += 1
                 continue
-
-            for table_name in page.get("TableNames", []):
-
-                arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}"
-
-                # ---------- DESCRIBE TABLE ----------
-                try:
-                    desc = dynamodb.describe_table(
-                        TableName=table_name
-                    )["Table"]
-
-                except ClientError as e:
-                    code = e.response["Error"]["Code"]
-
-                    if code in ["AccessDeniedException", "UnauthorizedOperation"]:
-                        skipped += 1
-
-                        results.append({
-                            "Region": region,
-                            "TableName": table_name,
-                            "TableArn": arn,
-                            "SSEType": "UNKNOWN",
-                            "KMSKey": "UNKNOWN",
-                            "Status": "SKIPPED",
-                            "Reason": "Access Denied (SCP/IAM)"
-                        })
-                        continue
-                    else:
-                        continue
-
-                total += 1
-
-                sse = desc.get("SSEDescription", {})
-
-                sse_type = sse.get("SSEType")
-                kms_key = sse.get("KMSMasterKeyArn")
-                status_flag = sse.get("SSEStatus")
-
-                # ---------- LOGIC ----------
-                if (
-                    sse_type == "KMS"
-                    and kms_key
-                    and status_flag == "ENABLED"
-                    and "alias/aws/dynamodb" not in (kms_key or "").lower()
-                ):
-                    status = "COMPLIANT"
-                    reason = "Customer Managed CMK"
-
-                else:
-                    status = "NON_COMPLIANT"
-                    non_compliant += 1
-
-                    if not sse:
-                        reason = "No encryption"
-                    elif not kms_key:
-                        reason = "No KMS key"
-                    elif "alias/aws/dynamodb" in (kms_key or "").lower():
-                        reason = "AWS Managed Key"
-                    else:
-                        reason = "Unknown configuration"
-
-                results.append({
-                    "Region": region,
-                    "TableName": table_name,
-                    "TableArn": arn,
-                    "SSEType": sse_type if sse_type else "None",
-                    "KMSKey": kms_key if kms_key else "None",
-                    "Status": status,
-                    "Reason": reason
-                })
+            else:
+                continue
 
     compliant = total - non_compliant
 
-    return results, total, compliant, non_compliant, skipped, skipped_regions
+    return results, total, compliant, non_compliant, skipped_tables, skipped_regions
 
 
 # ==================================================
@@ -229,7 +218,7 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="DynamoDB CMK Encryption (SCP Safe)"
+        description="Ensure DynamoDB tables use CMK encryption (SCP Safe)"
     )
 
     parser.add_argument("-R", "--role-arn", help="Role ARN")
@@ -239,7 +228,7 @@ def main():
     session = get_session(args.role_arn)
     account_id = get_account_id(session)
 
-    results, total, compliant, non_compliant, skipped, skipped_regions = \
+    results, total, compliant, non_compliant, skipped_tables, skipped_regions = \
         check_dynamodb_kms(session)
 
     print("\n====================================================")
@@ -250,8 +239,8 @@ def main():
     print(f"Total Tables Checked     : {total}")
     print(f"Compliant                : {compliant}")
     print(f"Non-Compliant            : {non_compliant}")
-    print(f"Skipped Tables           : {skipped}")
-    print(f"Skipped Regions (SCP)    : {len(skipped_regions)}")
+    print(f"Skipped Tables (SCP)     : {skipped_tables}")
+    print(f"Skipped Regions (SCP)    : {skipped_regions}")
 
     overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
 
