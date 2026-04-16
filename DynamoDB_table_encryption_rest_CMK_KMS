@@ -11,7 +11,6 @@ from botocore.exceptions import ClientError
 # ==================================================
 
 def get_session(role_arn=None):
-
     if role_arn:
         base = boto3.Session()
         sts = base.client("sts")
@@ -54,7 +53,28 @@ def get_regions(session):
 
 
 # ==================================================
-# CONTROL LOGIC (SCP SAFE)
+# HELPER: SCP SAFE ITERATOR
+# ==================================================
+
+def safe_paginate(paginator, skipped_regions, region):
+
+    try:
+        for page in paginator.paginate():
+            yield page
+
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+
+        if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+            print(f"Skipping region {region} (SCP Denied)")
+            skipped_regions.add(region)
+            return
+        else:
+            return
+
+
+# ==================================================
+# CONTROL LOGIC
 # ==================================================
 
 def check_dynamodb_kms(session):
@@ -65,6 +85,7 @@ def check_dynamodb_kms(session):
     total = 0
     non_compliant = 0
     skipped = 0
+    skipped_regions = set()
 
     account_id = get_account_id(session)
 
@@ -72,39 +93,38 @@ def check_dynamodb_kms(session):
 
     for region in tqdm(regions, desc="Scanning Regions"):
 
+        # ---------- REGION LEVEL ----------
         try:
             dynamodb = session.client("dynamodb", region_name=region)
-
             paginator = dynamodb.get_paginator("list_tables")
-            pages = paginator.paginate()
 
         except ClientError as e:
-
             code = e.response["Error"]["Code"]
 
-            if code in ["AuthFailure", "OptInRequired", "UnauthorizedOperation", "AccessDeniedException"]:
-                print(f"Skipping region {region} (Access Denied / SCP)")
-                skipped += 1
+            if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                print(f"Skipping region {region} (Access Denied)")
+                skipped_regions.add(region)
                 continue
             else:
                 continue
 
-        for page in pages:
+        # ---------- PAGINATION LEVEL ----------
+        for page in safe_paginate(paginator, skipped_regions, region):
+
+            if not page:
+                continue
 
             for table_name in page.get("TableNames", []):
 
                 arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}"
 
-                # ==================================================
-                # DESCRIBE TABLE (MAIN FAILURE POINT)
-                # ==================================================
+                # ---------- DESCRIBE TABLE ----------
                 try:
                     desc = dynamodb.describe_table(
                         TableName=table_name
                     )["Table"]
 
                 except ClientError as e:
-
                     code = e.response["Error"]["Code"]
 
                     if code in ["AccessDeniedException", "UnauthorizedOperation"]:
@@ -120,7 +140,6 @@ def check_dynamodb_kms(session):
                             "Reason": "Access Denied (SCP/IAM)"
                         })
                         continue
-
                     else:
                         continue
 
@@ -132,9 +151,7 @@ def check_dynamodb_kms(session):
                 kms_key = sse.get("KMSMasterKeyArn")
                 status_flag = sse.get("SSEStatus")
 
-                # ==================================================
-                # LOGIC
-                # ==================================================
+                # ---------- LOGIC ----------
                 if (
                     sse_type == "KMS"
                     and kms_key
@@ -169,7 +186,7 @@ def check_dynamodb_kms(session):
 
     compliant = total - non_compliant
 
-    return results, total, compliant, non_compliant, skipped
+    return results, total, compliant, non_compliant, skipped, skipped_regions
 
 
 # ==================================================
@@ -212,7 +229,7 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Ensure DynamoDB tables use CMK encryption (SCP aware)"
+        description="DynamoDB CMK Encryption (SCP Safe)"
     )
 
     parser.add_argument("-R", "--role-arn", help="Role ARN")
@@ -222,7 +239,7 @@ def main():
     session = get_session(args.role_arn)
     account_id = get_account_id(session)
 
-    results, total, compliant, non_compliant, skipped = \
+    results, total, compliant, non_compliant, skipped, skipped_regions = \
         check_dynamodb_kms(session)
 
     print("\n====================================================")
@@ -230,10 +247,11 @@ def main():
     print(f"ACCOUNT: {account_id}")
     print("====================================================\n")
 
-    print(f"Total Tables Checked : {total}")
-    print(f"Compliant            : {compliant}")
-    print(f"Non-Compliant        : {non_compliant}")
-    print(f"Skipped (Access Denied): {skipped}")
+    print(f"Total Tables Checked     : {total}")
+    print(f"Compliant                : {compliant}")
+    print(f"Non-Compliant            : {non_compliant}")
+    print(f"Skipped Tables           : {skipped}")
+    print(f"Skipped Regions (SCP)    : {len(skipped_regions)}")
 
     overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
 
