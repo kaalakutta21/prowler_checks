@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from datetime import datetime, timezone
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# CONFIG
+# ==================================================
+
+MAX_KEY_AGE_DAYS = 90
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="iam-key-rotation-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_access_key_rotation(session):
+
+    iam = session.client("iam")
+
+    results = []
+    total = 0
+    non_compliant = 0
+    skipped = 0
+
+    account_id = get_account_id(session)
+
+    now = datetime.now(timezone.utc)
+
+    print("\nScanning IAM Users...\n")
+
+    # ==================================================
+    # LIST USERS
+    # ==================================================
+
+    try:
+        paginator = iam.get_paginator("list_users")
+    except ClientError:
+        return [], 0, 0, 0, 0
+
+    try:
+        for page in paginator.paginate():
+
+            for user in page.get("Users", []):
+
+                user_name = user["UserName"]
+                user_arn = user["Arn"]
+
+                # ---------- ACCESS KEYS ----------
+                try:
+                    keys = iam.list_access_keys(UserName=user_name)["AccessKeyMetadata"]
+                except ClientError:
+                    skipped += 1
+                    continue
+
+                for key in keys:
+
+                    total += 1
+
+                    key_id = key["AccessKeyId"]
+                    status_key = key["Status"]
+                    create_date = key["CreateDate"]
+
+                    age_days = (now - create_date).days
+
+                    # ==================================================
+                    # LOGIC
+                    # ==================================================
+
+                    if status_key == "Inactive":
+                        status = "COMPLIANT"
+                        reason = "Inactive key"
+
+                    elif age_days > MAX_KEY_AGE_DAYS:
+                        status = "NON_COMPLIANT"
+                        non_compliant += 1
+                        reason = f"Older than {MAX_KEY_AGE_DAYS} days"
+
+                    else:
+                        status = "COMPLIANT"
+                        reason = "Within rotation period"
+
+                    results.append({
+                        "UserName": user_name,
+                        "UserArn": user_arn,
+                        "AccessKeyId": key_id,
+                        "StatusKey": status_key,
+                        "CreateDate": create_date.strftime("%Y-%m-%d"),
+                        "AgeDays": age_days,
+                        "Status": status,
+                        "Reason": reason
+                    })
+
+    except ClientError:
+        skipped += 1
+
+    compliant = total - non_compliant
+
+    return results, total, compliant, non_compliant, skipped
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"iam_access_key_rotation_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "UserName",
+            "UserArn",
+            "AccessKeyId",
+            "StatusKey",
+            "CreateDate",
+            "AgeDays",
+            "Status",
+            "Reason"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Ensure IAM access keys are rotated within 90 days"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total, compliant, non_compliant, skipped = \
+        check_access_key_rotation(session)
+
+    print("\n====================================================")
+    print("CONTROL: IAM Access Key Rotation")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Keys Checked : {total}")
+    print(f"Compliant          : {compliant}")
+    print(f"Non-Compliant      : {non_compliant}")
+    print(f"Skipped            : {skipped}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
