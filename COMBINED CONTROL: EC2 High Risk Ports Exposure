@@ -39,46 +39,30 @@ def get_regions(session):
             if r["OptInStatus"] in ["opt-in-not-required","opted-in"]]
 
 def is_public(rule):
-
-    # IPv4
     for ip in rule.get("IpRanges", []):
         if ip.get("CidrIp") == "0.0.0.0/0":
             return True
-
-    # IPv6
     for ip in rule.get("Ipv6Ranges", []):
         if ip.get("CidrIpv6") == "::/0":
             return True
-
     return False
 
-
-def match_rule(rule, port):
-
+def matches_port(rule, port):
     proto = rule.get("IpProtocol")
 
-    # ALL PROTOCOLS
     if proto == "-1":
-        return True, "ALL_PORTS"
+        return True
 
     if proto != "tcp":
-        return False, None
+        return False
 
     fp = rule.get("FromPort")
     tp = rule.get("ToPort")
 
     if fp is None or tp is None:
-        return False, None
+        return False
 
-    if fp <= port <= tp:
-        return True, "SPECIFIC_PORT"
-
-    return False, None
-
-
-def get_severity(match_type):
-    return "CRITICAL" if match_type == "ALL_PORTS" else "HIGH"
-
+    return fp <= port <= tp
 
 # ==================================================
 # MAIN LOGIC
@@ -90,22 +74,17 @@ def scan(session):
     regions = get_regions(session)
 
     results = []
-
     total_instances = 0
-    total_rules_checked = 0
-    total_public_rules = 0
 
     for region in tqdm(regions, desc="Regions"):
 
         ec2 = session.client("ec2", region_name=region)
 
-        # Load SGs
         sg_map = {}
         for page in ec2.get_paginator("describe_security_groups").paginate():
             for sg in page["SecurityGroups"]:
                 sg_map[sg["GroupId"]] = sg
 
-        # Load instances
         for page in ec2.get_paginator("describe_instances").paginate():
 
             for res in page["Reservations"]:
@@ -116,47 +95,45 @@ def scan(session):
                     instance_id = inst["InstanceId"]
                     arn = f"arn:aws:ec2:{region}:{account}:instance/{instance_id}"
 
-                    # 🔥 DO NOT deduplicate (important)
+                    # Collect SGs from ENIs
+                    sg_ids = []
                     for eni in inst.get("NetworkInterfaces", []):
                         for g in eni.get("Groups", []):
+                            sg_ids.append(g["GroupId"])
 
-                            sg_id = g["GroupId"]
-                            sg = sg_map.get(sg_id)
+                    instance_findings = {control: False for control in CONTROL_PORTS}
 
-                            if not sg:
+                    # Evaluate rules
+                    for sg_id in sg_ids:
+
+                        sg = sg_map.get(sg_id)
+                        if not sg:
+                            continue
+
+                        for rule in sg.get("IpPermissions", []):
+
+                            if not is_public(rule):
                                 continue
 
-                            for rule in sg.get("IpPermissions", []):
+                            for control, ports in CONTROL_PORTS.items():
+                                for port in ports:
+                                    if matches_port(rule, port):
+                                        instance_findings[control] = True
 
-                                total_rules_checked += 1
+                    # Final result per control
+                    for control in CONTROL_PORTS:
 
-                                if not is_public(rule):
-                                    continue
+                        status = "NON_COMPLIANT" if instance_findings[control] else "COMPLIANT"
 
-                                total_public_rules += 1
+                        results.append({
+                            "Region": region,
+                            "InstanceId": instance_id,
+                            "InstanceArn": arn,
+                            "Control": control,
+                            "Status": status
+                        })
 
-                                # 🔥 Evaluate EVERY control + port
-                                for control, ports in CONTROL_PORTS.items():
-
-                                    for port in ports:
-
-                                        match, match_type = match_rule(rule, port)
-
-                                        if match:
-
-                                            results.append({
-                                                "Control": control,
-                                                "Region": region,
-                                                "InstanceId": instance_id,
-                                                "InstanceArn": arn,
-                                                "SecurityGroupId": sg_id,
-                                                "Port": port,
-                                                "MatchType": match_type,
-                                                "Severity": get_severity(match_type),
-                                                "Status": "NON_COMPLIANT"
-                                            })
-
-    return results, total_instances, total_rules_checked, total_public_rules
+    return results, total_instances
 
 
 # ==================================================
@@ -165,14 +142,12 @@ def scan(session):
 
 def write_csv(account, results):
 
-    file = f"final_full_sg_scan_{account}.csv"
+    file = f"final_all_instances_sg_audit_{account}.csv"
 
     with open(file, "w", newline="") as f:
 
         writer = csv.DictWriter(f, fieldnames=[
-            "Account","Control","Region","InstanceId",
-            "InstanceArn","SecurityGroupId","Port",
-            "MatchType","Severity","Status"
+            "Account","Region","InstanceId","InstanceArn","Control","Status"
         ])
 
         writer.writeheader()
@@ -199,7 +174,7 @@ def main():
         sts = session.client("sts")
         creds = sts.assume_role(
             RoleArn=args.role_arn,
-            RoleSessionName="sg-full"
+            RoleSessionName="sg-final"
         )["Credentials"]
 
         session = boto3.Session(
@@ -210,15 +185,13 @@ def main():
 
     account = session.client("sts").get_caller_identity()["Account"]
 
-    results, total_instances, total_rules, total_public = scan(session)
+    results, total_instances = scan(session)
 
     print("\n====================================================")
     print(f"ACCOUNT: {account}")
     print("====================================================")
-    print(f"Instances Seen       : {total_instances}")
-    print(f"Rules Checked        : {total_rules}")
-    print(f"Public Rules         : {total_public}")
-    print(f"Total Findings       : {len(results)}")
+    print(f"Total Instances: {total_instances}")
+    print(f"Total Rows: {len(results)}")
 
     csv_file = write_csv(account, results)
 
