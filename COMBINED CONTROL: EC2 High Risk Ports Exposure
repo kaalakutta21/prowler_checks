@@ -6,18 +6,30 @@ import csv
 from tqdm import tqdm
 
 # ==================================================
-# CONTROL MAP
+# FULL CONTROL MAP (RESTORED)
 # ==================================================
 
 CONTROL_PORTS = {
-"Ensure no EC2 instances allow ingress from the internet to TCP port 22 (SSH)":[22],
-"Ensure no EC2 instances allow ingress from the internet to TCP port 3389 (RDP)":[3389],
-"Ensure no EC2 instances allow ingress from the internet to TCP port 3306 (MySQL).":[3306],
-"Ensure no EC2 instances allow ingress from the internet to TCP port 5432 (PostgreSQL)":[5432],
-"Ensure no EC2 instances allow ingress from the internet to TCP port 6379 (Redis).":[6379]
-}
 
-# (trimmed controls for clarity — you can paste full list back)
+"Ensure no EC2 instances allow ingress from the internet to Cassandra ports (TCP 7000, 7001, 7199, 9042, 9160).":[7000,7001,7199,9042,9160],
+"Ensure no EC2 instances allow ingress from the internet to Elasticsearch and Kibana ports (TCP 9200, 9300, 5601).":[9200,9300,5601],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 11211 (Memcached).":[11211],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 139 or 445 (CIFS).":[139,445],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 1433 or 1434 (SQL Server).":[1433,1434],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 1521, 2483 or 2484 (Oracle).":[1521,2483,2484],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 20 or 21 (FTP)":[20,21],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 22 (SSH)":[22],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 23 (Telnet).":[23],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 27017 or 27018 (MongoDB)":[27017,27018],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 3306 (MySQL).":[3306],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 3389 (RDP)":[3389],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 389 or 636 (LDAP).":[389,636],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 5432 (PostgreSQL)":[5432],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 6379 (Redis).":[6379],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 88, 464, 749 or 750 (Kerberos).":[88,464,749,750],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 9092 (Kafka).":[9092]
+
+}
 
 # ==================================================
 # HELPERS
@@ -28,36 +40,42 @@ def get_regions(session):
     return [r["RegionName"] for r in ec2.describe_regions(AllRegions=True)["Regions"]
             if r["OptInStatus"] in ["opt-in-not-required","opted-in"]]
 
+
 def is_public(rule):
+
     for ip in rule.get("IpRanges", []):
         if ip.get("CidrIp") == "0.0.0.0/0":
             return True
+
     for ip in rule.get("Ipv6Ranges", []):
         if ip.get("CidrIpv6") == "::/0":
             return True
+
     return False
 
-def match(rule, ports):
+
+def match_port(rule, port):
 
     proto = rule.get("IpProtocol")
 
+    # ALL PORTS / ALL PROTOCOLS
     if proto == "-1":
-        return True
+        return True, "ALL_PORTS"
 
     if proto != "tcp":
-        return False
+        return False, None
 
-    fp = rule.get("FromPort")
-    tp = rule.get("ToPort")
+    from_port = rule.get("FromPort")
+    to_port = rule.get("ToPort")
 
-    if fp is None or tp is None:
-        return False
+    if from_port is None or to_port is None:
+        return False, None
 
-    for p in ports:
-        if fp <= p <= tp:
-            return True
+    if from_port <= port <= to_port:
+        return True, "SPECIFIC_PORT"
 
-    return False
+    return False, None
+
 
 # ==================================================
 # SAFE INSTANCE FETCH
@@ -70,17 +88,15 @@ def get_all_instances(ec2):
     paginator = ec2.get_paginator("describe_instances")
 
     for page in paginator.paginate():
-
-        reservations = page.get("Reservations", [])
-
-        for res in reservations:
+        for res in page.get("Reservations", []):
             for inst in res.get("Instances", []):
                 instances.append(inst)
 
     return instances
 
+
 # ==================================================
-# MAIN LOGIC
+# MAIN SCAN
 # ==================================================
 
 def scan(session):
@@ -89,7 +105,9 @@ def scan(session):
     regions = get_regions(session)
 
     results = []
+
     total_instances = 0
+    total_findings = 0
 
     for region in tqdm(regions, desc="Regions"):
 
@@ -101,10 +119,10 @@ def scan(session):
             for sg in page["SecurityGroups"]:
                 sg_map[sg["GroupId"]] = sg
 
-        # 🔥 SAFE instance fetch
+        # Load ALL instances
         instances = get_all_instances(ec2)
 
-        print(f"Region {region}: {len(instances)} instances")
+        print(f"{region} → Instances: {len(instances)}")
 
         for inst in instances:
 
@@ -113,22 +131,17 @@ def scan(session):
             instance_id = inst["InstanceId"]
             arn = f"arn:aws:ec2:{region}:{account}:instance/{instance_id}"
 
-            # 🔥 DOUBLE METHOD SG EXTRACTION (CRITICAL FIX)
-
+            # SG extraction (both methods)
             sg_ids = []
 
-            # Method 1: ENI
             for eni in inst.get("NetworkInterfaces", []):
                 for g in eni.get("Groups", []):
                     sg_ids.append(g["GroupId"])
 
-            # Method 2: fallback
             for g in inst.get("SecurityGroups", []):
                 sg_ids.append(g["GroupId"])
 
-            instance_findings = {c: False for c in CONTROL_PORTS}
-
-            for sg_id in set(sg_ids):
+            for sg_id in sg_ids:
 
                 sg = sg_map.get(sg_id)
                 if not sg:
@@ -141,20 +154,27 @@ def scan(session):
 
                     for control, ports in CONTROL_PORTS.items():
 
-                        if match(rule, ports):
-                            instance_findings[control] = True
+                        for port in ports:
 
-            for control in CONTROL_PORTS:
+                            match, match_type = match_port(rule, port)
 
-                results.append({
-                    "Region": region,
-                    "InstanceId": instance_id,
-                    "InstanceArn": arn,
-                    "Control": control,
-                    "Status": "NON_COMPLIANT" if instance_findings[control] else "COMPLIANT"
-                })
+                            if match:
 
-    return results, total_instances
+                                total_findings += 1
+
+                                results.append({
+                                    "Region": region,
+                                    "InstanceId": instance_id,
+                                    "InstanceArn": arn,
+                                    "SecurityGroupId": sg_id,
+                                    "Control": control,
+                                    "Port": port,
+                                    "MatchType": match_type,
+                                    "Status": "NON_COMPLIANT"
+                                })
+
+    return results, total_instances, total_findings
+
 
 # ==================================================
 # CSV
@@ -162,12 +182,13 @@ def scan(session):
 
 def write_csv(account, results):
 
-    file = f"ec2_final_fixed_{account}.csv"
+    file = f"ec2_sg_full_findings_{account}.csv"
 
     with open(file, "w", newline="") as f:
 
         writer = csv.DictWriter(f, fieldnames=[
-            "Account","Region","InstanceId","InstanceArn","Control","Status"
+            "Account","Region","InstanceId","InstanceArn",
+            "SecurityGroupId","Control","Port","MatchType","Status"
         ])
 
         writer.writeheader()
@@ -176,6 +197,7 @@ def write_csv(account, results):
             writer.writerow({"Account": account, **r})
 
     return file
+
 
 # ==================================================
 # MAIN
@@ -193,7 +215,7 @@ def main():
         sts = session.client("sts")
         creds = sts.assume_role(
             RoleArn=args.role_arn,
-            RoleSessionName="final-fix"
+            RoleSessionName="sg-final"
         )["Credentials"]
 
         session = boto3.Session(
@@ -204,13 +226,13 @@ def main():
 
     account = session.client("sts").get_caller_identity()["Account"]
 
-    results, total_instances = scan(session)
+    results, total_instances, total_findings = scan(session)
 
     print("\n====================================================")
     print(f"ACCOUNT: {account}")
     print("====================================================")
-    print(f"Total Instances Seen: {total_instances}")
-    print(f"Total Rows: {len(results)}")
+    print(f"Total Instances Seen : {total_instances}")
+    print(f"Total Findings       : {total_findings}")
 
     csv_file = write_csv(account, results)
 
