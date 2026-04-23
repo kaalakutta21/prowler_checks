@@ -4,127 +4,39 @@ import boto3
 import argparse
 import csv
 from tqdm import tqdm
-from botocore.exceptions import ClientError
 
 # ==================================================
-# CONTROL → PORT MAPPING (EXACT NAMES)
+# CONTROL → PORT MAPPING (UNCHANGED)
 # ==================================================
 
 CONTROL_PORTS = {
-
-"Ensure no EC2 instances allow ingress from the internet to Cassandra ports (TCP 7000, 7001, 7199, 9042, 9160).":
-    [7000,7001,7199,9042,9160],
-
-"Ensure no EC2 instances allow ingress from the internet to Elasticsearch and Kibana ports (TCP 9200, 9300, 5601).":
-    [9200,9300,5601],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 11211 (Memcached).":
-    [11211],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 139 or 445 (CIFS).":
-    [139,445],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 1433 or 1434 (SQL Server).":
-    [1433,1434],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 1521, 2483 or 2484 (Oracle).":
-    [1521,2483,2484],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 20 or 21 (FTP)":
-    [20,21],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 22 (SSH)":
-    [22],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 23 (Telnet).":
-    [23],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 27017 or 27018 (MongoDB)":
-    [27017,27018],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 3306 (MySQL).":
-    [3306],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 3389 (RDP)":
-    [3389],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 389 or 636 (LDAP).":
-    [389,636],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 5432 (PostgreSQL)":
-    [5432],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 6379 (Redis).":
-    [6379],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 88, 464, 749 or 750 (Kerberos).":
-    [88,464,749,750],
-
-"Ensure no EC2 instances allow ingress from the internet to TCP port 9092 (Kafka).":
-    [9092]
+"Ensure no EC2 instances allow ingress from the internet to Cassandra ports (TCP 7000, 7001, 7199, 9042, 9160).":[7000,7001,7199,9042,9160],
+"Ensure no EC2 instances allow ingress from the internet to Elasticsearch and Kibana ports (TCP 9200, 9300, 5601).":[9200,9300,5601],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 11211 (Memcached).":[11211],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 139 or 445 (CIFS).":[139,445],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 1433 or 1434 (SQL Server).":[1433,1434],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 1521, 2483 or 2484 (Oracle).":[1521,2483,2484],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 20 or 21 (FTP)":[20,21],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 22 (SSH)":[22],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 23 (Telnet).":[23],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 27017 or 27018 (MongoDB)":[27017,27018],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 3306 (MySQL).":[3306],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 3389 (RDP)":[3389],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 389 or 636 (LDAP).":[389,636],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 5432 (PostgreSQL)":[5432],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 6379 (Redis).":[6379],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 88, 464, 749 or 750 (Kerberos).":[88,464,749,750],
+"Ensure no EC2 instances allow ingress from the internet to TCP port 9092 (Kafka).":[9092]
 }
 
 # ==================================================
-# AUTH
-# ==================================================
-
-def get_session(role_arn=None):
-    if role_arn:
-        sts = boto3.client("sts")
-        creds = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="combined-sg-audit"
-        )["Credentials"]
-
-        return boto3.Session(
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"]
-        )
-    return boto3.Session()
-
-
-def get_account_id(session):
-    return session.client("sts").get_caller_identity()["Account"]
-
-
-# ==================================================
-# REGIONS
+# HELPERS
 # ==================================================
 
 def get_regions(session):
     ec2 = session.client("ec2", region_name="us-east-1")
-    regions = ec2.describe_regions(AllRegions=True)["Regions"]
-
-    return [
-        r["RegionName"]
-        for r in regions
-        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
-    ]
-
-
-# ==================================================
-# PORT MATCH LOGIC
-# ==================================================
-
-def matches_port(rule, target_port):
-
-    proto = rule.get("IpProtocol")
-
-    if proto not in ["tcp", "-1"]:
-        return False
-
-    if proto == "-1":
-        return True
-
-    from_port = rule.get("FromPort")
-    to_port = rule.get("ToPort")
-
-    if from_port is None or to_port is None:
-        return False
-
-    return from_port <= target_port <= to_port
-
+    return [r["RegionName"] for r in ec2.describe_regions(AllRegions=True)["Regions"]
+            if r["OptInStatus"] in ["opt-in-not-required","opted-in"]]
 
 def is_public(rule):
 
@@ -132,51 +44,84 @@ def is_public(rule):
         if ip.get("CidrIp") == "0.0.0.0/0":
             return True
 
+    for ip in rule.get("Ipv6Ranges", []):
+        if ip.get("CidrIpv6") == "::/0":
+            return True
+
     return False
 
 
+def matches_port(rule, port):
+
+    proto = rule.get("IpProtocol")
+
+    # ALL PROTOCOLS → matches everything
+    if proto == "-1":
+        return True, "ALL_PORTS"
+
+    if proto != "tcp":
+        return False, None
+
+    from_port = rule.get("FromPort")
+    to_port = rule.get("ToPort")
+
+    if from_port is None or to_port is None:
+        return False, None
+
+    if from_port <= port <= to_port:
+        return True, "SPECIFIC_PORT"
+
+    return False, None
+
+
+def get_severity(match_type):
+    if match_type == "ALL_PORTS":
+        return "CRITICAL"
+    return "HIGH"
+
+
 # ==================================================
-# MAIN CONTROL LOGIC
+# MAIN LOGIC
 # ==================================================
 
-def check_controls(session):
+def scan(session):
 
+    account = session.client("sts").get_caller_identity()["Account"]
     regions = get_regions(session)
-    account_id = get_account_id(session)
 
     results = []
-    total = 0
-    non_compliant = 0
+    total_instances = 0
 
-    for region in tqdm(regions, desc="Scanning Regions"):
+    for region in tqdm(regions, desc="Regions"):
 
-        try:
-            ec2 = session.client("ec2", region_name=region)
-
-            inst_pages = ec2.get_paginator("describe_instances").paginate()
-            sg_pages = ec2.get_paginator("describe_security_groups").paginate()
-
-        except ClientError:
-            continue
+        ec2 = session.client("ec2", region_name=region)
 
         # Build SG map
         sg_map = {}
-
-        for page in sg_pages:
+        for page in ec2.get_paginator("describe_security_groups").paginate():
             for sg in page["SecurityGroups"]:
                 sg_map[sg["GroupId"]] = sg
 
-        # Check instances
-        for page in inst_pages:
+        # Scan instances
+        for page in ec2.get_paginator("describe_instances").paginate():
+
             for res in page["Reservations"]:
                 for inst in res["Instances"]:
 
+                    total_instances += 1
+
                     instance_id = inst["InstanceId"]
-                    arn = f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}"
+                    arn = f"arn:aws:ec2:{region}:{account}:instance/{instance_id}"
 
-                    for sg_ref in inst.get("SecurityGroups", []):
+                    # 🔥 Correct SG extraction (ENI-based)
+                    sg_ids = []
+                    for eni in inst.get("NetworkInterfaces", []):
+                        for g in eni.get("Groups", []):
+                            sg_ids.append(g["GroupId"])
 
-                        sg = sg_map.get(sg_ref["GroupId"])
+                    for sg_id in set(sg_ids):
+
+                        sg = sg_map.get(sg_id)
                         if not sg:
                             continue
 
@@ -189,55 +134,49 @@ def check_controls(session):
 
                                 for port in ports:
 
-                                    if matches_port(rule, port):
+                                    match, match_type = matches_port(rule, port)
 
-                                        total += 1
-                                        non_compliant += 1
+                                    if match:
+
+                                        severity = get_severity(match_type)
 
                                         results.append({
                                             "Control": control,
                                             "Region": region,
                                             "InstanceId": instance_id,
                                             "InstanceArn": arn,
-                                            "SecurityGroupId": sg["GroupId"],
+                                            "SecurityGroupId": sg_id,
                                             "Port": port,
+                                            "MatchType": match_type,
+                                            "Severity": severity,
                                             "Status": "NON_COMPLIANT"
                                         })
 
-    return results, total, non_compliant
+    return results, total_instances
 
 
 # ==================================================
 # CSV
 # ==================================================
 
-def write_csv(account_id, results):
+def write_csv(account, results):
 
-    filename = f"combined_sg_controls_{account_id}.csv"
+    file = f"final_combined_sg_scan_{account}.csv"
 
-    with open(filename, "w", newline="") as f:
+    with open(file, "w", newline="") as f:
 
-        fields = [
-            "Account",
-            "Control",
-            "Region",
-            "InstanceId",
-            "InstanceArn",
-            "SecurityGroupId",
-            "Port",
-            "Status"
-        ]
+        writer = csv.DictWriter(f, fieldnames=[
+            "Account","Control","Region","InstanceId",
+            "InstanceArn","SecurityGroupId","Port",
+            "MatchType","Severity","Status"
+        ])
 
-        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
 
         for r in results:
-            writer.writerow({
-                "Account": account_id,
-                **r
-            })
+            writer.writerow({"Account": account, **r})
 
-    return filename
+    return file
 
 
 # ==================================================
@@ -246,29 +185,37 @@ def write_csv(account_id, results):
 
 def main():
 
-    parser = argparse.ArgumentParser(
-        description="Combined EC2 SG High Risk Port Exposure Audit"
-    )
-
-    parser.add_argument("-R", "--role-arn", help="Role ARN")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-R","--role-arn")
     args = parser.parse_args()
 
-    session = get_session(args.role_arn)
-    account_id = get_account_id(session)
+    session = boto3.Session()
 
-    results, total, non_compliant = check_controls(session)
+    if args.role_arn:
+        sts = session.client("sts")
+        creds = sts.assume_role(
+            RoleArn=args.role_arn,
+            RoleSessionName="combined-sg"
+        )["Credentials"]
+
+        session = boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    account = session.client("sts").get_caller_identity()["Account"]
+
+    results, total_instances = scan(session)
 
     print("\n====================================================")
-    print("COMBINED CONTROL: EC2 High Risk Ports Exposure")
-    print(f"ACCOUNT: {account_id}")
-    print("====================================================\n")
+    print(f"ACCOUNT: {account}")
+    print("====================================================")
+    print(f"Total Instances Seen : {total_instances}")
+    print(f"Total Findings       : {len(results)}")
 
-    print(f"Total Findings : {total}")
-    print(f"Non-Compliant  : {non_compliant}")
-
-    csv_file = write_csv(account_id, results)
-
-    print(f"\nCSV Report Generated: {csv_file}\n")
+    csv_file = write_csv(account, results)
+    print(f"\nCSV Generated: {csv_file}\n")
 
 
 if __name__ == "__main__":
