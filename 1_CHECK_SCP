@@ -8,7 +8,7 @@ import os
 import re
 import sys
 from datetime import datetime
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from tqdm import tqdm
@@ -16,7 +16,7 @@ except ImportError:
     tqdm = None
 
 # =========================================================
-# OPTIONAL COLORS
+# COLORS
 # =========================================================
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -34,15 +34,15 @@ def c(text, color):
 
 
 # =========================================================
-# ARGPARSE
+# ARGUMENTS
 # =========================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Audit AWS effective cross-region read-only access, SCP visibility, and IAM clues."
+        description="Audit AWS cross-region effective access, SCP clues, and read-only regional permissions."
     )
     parser.add_argument(
         "-R", "--role-arn",
-        help="Optional role ARN to assume before running checks."
+        help="Optional role ARN to assume."
     )
     parser.add_argument(
         "--external-id",
@@ -50,40 +50,132 @@ def parse_args():
     )
     parser.add_argument(
         "--profile",
-        help="Optional AWS profile name."
+        help="Optional AWS CLI profile."
     )
     parser.add_argument(
         "--region",
         default="ap-south-1",
-        help="Base region for global/control-plane calls. Default: ap-south-1"
+        help="Base region for control plane calls. Default: ap-south-1"
     )
     parser.add_argument(
         "--outdir",
         default="region_access_audit_output",
-        help="Directory to store output files."
+        help="Output directory for reports."
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel workers. Default: 10"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["fast", "full"],
+        default="fast",
+        help="fast = ec2/lambda/rds only, full = add dynamodb/ecs/eks"
+    )
+    parser.add_argument(
+        "--regions",
+        nargs="*",
+        help="Optional explicit region list to test. Example: --regions ap-south-1 us-east-1 eu-west-1"
+    )
+    parser.add_argument(
+        "--enabled-regions-only",
+        action="store_true",
+        default=True,
+        help="Test only enabled regions (opted-in / opt-in-not-required). Default behavior."
+    )
+    parser.add_argument(
+        "--include-disabled-regions",
+        action="store_true",
+        help="Also include disabled regions in testing."
     )
     parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable terminal colors."
     )
-    parser.add_argument(
-        "--timeout-note",
-        action="store_true",
-        help="Print extra explanatory notes in terminal."
-    )
     return parser.parse_args()
 
 
 ARGS = parse_args()
+
 if ARGS.no_color:
     RESET = BOLD = GREEN = RED = YELLOW = BLUE = CYAN = MAGENTA = GRAY = ""
-    def c(text, color):  # noqa
+
+    def c(text, color):
         return text
 
 
 # =========================================================
-# AWS SESSION
+# HELPERS
+# =========================================================
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def iso_now():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+def write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def print_section(title):
+    print("\n" + c("=" * 100, BLUE))
+    print(c(title, BOLD + CYAN))
+    print(c("=" * 100, BLUE))
+
+
+def yes_no(v):
+    return c("YES", GREEN) if v else c("NO", RED)
+
+
+def safe_client(session, service, region_name=None):
+    return session.client(service, region_name=region_name or ARGS.region)
+
+
+def short_error(err):
+    code = err.response.get("Error", {}).get("Code", "Unknown")
+    msg = err.response.get("Error", {}).get("Message", "") or str(err)
+    return f"{code}: {msg}"
+
+
+def classify_error(err):
+    code = err.response.get("Error", {}).get("Code", "Unknown")
+    msg = err.response.get("Error", {}).get("Message", "") or str(err)
+    full = f"{code}: {msg}".lower()
+
+    if "service control policy" in full:
+        return "SCP_DENY"
+    if code in ("OptInRequired",) or "not subscribed to this region" in full:
+        return "REGION_NOT_ENABLED"
+    if "permissions boundary" in full:
+        return "PERMISSION_BOUNDARY_DENY"
+    if "session policy" in full:
+        return "SESSION_POLICY_DENY"
+    if (
+        code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "Client.UnauthorizedOperation")
+        or "not authorized" in full
+        or "accessdenied" in full
+    ):
+        return "IAM_OR_SESSION_DENY"
+    if code in ("UnrecognizedClientException", "InvalidClientTokenId", "ExpiredToken"):
+        return "CREDENTIAL_ISSUE"
+    if code in ("RequestLimitExceeded", "Throttling", "ThrottlingException", "TooManyRequestsException"):
+        return "THROTTLED"
+    return "OTHER_ERROR"
+
+
+# =========================================================
+# SESSION
 # =========================================================
 def get_base_session(profile=None, region_name="ap-south-1"):
     if profile:
@@ -102,6 +194,7 @@ def assume_role(session, role_arn, external_id=None):
 
     resp = sts.assume_role(**kwargs)
     creds = resp["Credentials"]
+
     return boto3.Session(
         aws_access_key_id=creds["AccessKeyId"],
         aws_secret_access_key=creds["SecretAccessKey"],
@@ -118,79 +211,17 @@ def get_session():
 
 
 # =========================================================
-# HELPERS
-# =========================================================
-def safe_client(session, service, region_name=None):
-    return session.client(service, region_name=region_name or ARGS.region)
-
-
-def iso_now():
-    return datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
-
-
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
-
-
-def write_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, default=str)
-
-
-def write_text(path, text):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
-def classify_error(err):
-    code = err.response.get("Error", {}).get("Code", "Unknown")
-    msg = err.response.get("Error", {}).get("Message", "") or str(err)
-    full = f"{code}: {msg}".lower()
-
-    if "service control policy" in full or "explicit deny" in full and "service control policy" in full:
-        return "SCP_DENY"
-    if code in ("OptInRequired", "AuthFailure") and "not subscribed" in full:
-        return "REGION_NOT_ENABLED"
-    if "not authorized" in full or "accessdenied" in full or code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "Client.UnauthorizedOperation"):
-        if "permissions boundary" in full:
-            return "PERMISSION_BOUNDARY_DENY"
-        if "session policy" in full:
-            return "SESSION_POLICY_DENY"
-        return "IAM_OR_SESSION_DENY"
-    if code in ("UnrecognizedClientException", "InvalidClientTokenId", "ExpiredToken"):
-        return "CREDENTIAL_ISSUE"
-    if code in ("RequestLimitExceeded", "Throttling", "ThrottlingException", "TooManyRequestsException"):
-        return "THROTTLED"
-    return "OTHER_ERROR"
-
-
-def short_error(err):
-    code = err.response.get("Error", {}).get("Code", "Unknown")
-    msg = err.response.get("Error", {}).get("Message", "") or str(err)
-    return f"{code}: {msg}"
-
-
-def print_section(title):
-    print("\n" + c("=" * 90, BLUE))
-    print(c(title, BOLD + CYAN))
-    print(c("=" * 90, BLUE))
-
-
-def yes_no(value):
-    return c("YES", GREEN) if value else c("NO", RED)
-
-
-# =========================================================
 # IDENTITY
 # =========================================================
 def get_identity(session):
     sts = safe_client(session, "sts")
     resp = sts.get_caller_identity()
+
     arn = resp.get("Arn", "")
     account = resp.get("Account", "")
     user_id = resp.get("UserId", "")
 
-    identity = {
+    out = {
         "account_id": account,
         "arn": arn,
         "user_id": user_id,
@@ -202,24 +233,24 @@ def get_identity(session):
     }
 
     if ":assumed-role/" in arn:
-        identity["principal_type"] = "assumed-role"
-        identity["assumed_role"] = True
+        out["principal_type"] = "assumed-role"
+        out["assumed_role"] = True
         m = re.search(r"assumed-role/([^/]+)/(.+)$", arn)
         if m:
-            identity["role_name"] = m.group(1)
-            identity["session_name"] = m.group(2)
+            out["role_name"] = m.group(1)
+            out["session_name"] = m.group(2)
     elif ":user/" in arn:
-        identity["principal_type"] = "user"
-        identity["user_name"] = arn.split("/")[-1]
+        out["principal_type"] = "user"
+        out["user_name"] = arn.split("/")[-1]
     elif ":role/" in arn:
-        identity["principal_type"] = "role"
-        identity["role_name"] = arn.split("/")[-1]
+        out["principal_type"] = "role"
+        out["role_name"] = arn.split("/")[-1]
 
-    return identity
+    return out
 
 
 # =========================================================
-# IAM VISIBILITY
+# IAM CLUES
 # =========================================================
 def inspect_iam(session, identity):
     out = {
@@ -237,18 +268,16 @@ def inspect_iam(session, identity):
         if identity["principal_type"] == "user" and identity["user_name"]:
             uname = identity["user_name"]
 
-            up = iam.get_user(UserName=uname)["User"]
-            out["permission_boundary"] = up.get("PermissionsBoundary")
+            user = iam.get_user(UserName=uname)["User"]
+            out["permission_boundary"] = user.get("PermissionsBoundary")
 
             paginator = iam.get_paginator("list_attached_user_policies")
             for page in paginator.paginate(UserName=uname):
-                for p in page.get("AttachedPolicies", []):
-                    out["managed_policies"].append(p)
+                out["managed_policies"].extend(page.get("AttachedPolicies", []))
 
             paginator = iam.get_paginator("list_user_policies")
             for page in paginator.paginate(UserName=uname):
-                for p in page.get("PolicyNames", []):
-                    out["inline_policies"].append(p)
+                out["inline_policies"].extend(page.get("PolicyNames", []))
 
         elif identity["role_name"]:
             rname = identity["role_name"]
@@ -258,13 +287,11 @@ def inspect_iam(session, identity):
 
             paginator = iam.get_paginator("list_attached_role_policies")
             for page in paginator.paginate(RoleName=rname):
-                for p in page.get("AttachedPolicies", []):
-                    out["managed_policies"].append(p)
+                out["managed_policies"].extend(page.get("AttachedPolicies", []))
 
             paginator = iam.get_paginator("list_role_policies")
             for page in paginator.paginate(RoleName=rname):
-                for p in page.get("PolicyNames", []):
-                    out["inline_policies"].append(p)
+                out["inline_policies"].extend(page.get("PolicyNames", []))
 
         for p in out["managed_policies"]:
             if p.get("PolicyName") == "ReadOnlyAccess" or p.get("PolicyArn", "").endswith(":policy/ReadOnlyAccess"):
@@ -278,10 +305,39 @@ def inspect_iam(session, identity):
 
 
 # =========================================================
-# ORG / SCP VISIBILITY
+# SCP CLUES
 # =========================================================
+def analyze_scp_content(content):
+    detected = False
+    clues = []
+
+    try:
+        doc = json.loads(content) if isinstance(content, str) else content
+        statements = doc.get("Statement", [])
+        if isinstance(statements, dict):
+            statements = [statements]
+
+        for stmt in statements:
+            stmt_text = json.dumps(stmt).lower()
+
+            if "aws:requestedregion" in stmt_text:
+                detected = True
+                clues.append("Contains aws:RequestedRegion condition")
+            if stmt.get("Effect") == "Deny":
+                clues.append("Contains Deny statement")
+            if "notaction" in stmt_text:
+                clues.append("Uses NotAction (possible partial bypass / exception)")
+            if "arnnotlike" in stmt_text or "stringnotequals" in stmt_text or "stringequals" in stmt_text:
+                clues.append("Contains conditional exception logic")
+
+    except Exception as e:
+        clues.append(f"Could not parse SCP JSON: {e}")
+
+    return detected, list(dict.fromkeys(clues))
+
+
 def inspect_scp(session, account_id):
-    result = {
+    out = {
         "organizations_accessible": False,
         "scp_attached": [],
         "scp_details": [],
@@ -293,222 +349,210 @@ def inspect_scp(session, account_id):
     org = safe_client(session, "organizations", region_name="us-east-1")
 
     try:
-        result["organizations_accessible"] = True
+        out["organizations_accessible"] = True
 
         paginator = org.get_paginator("list_policies_for_target")
         for page in paginator.paginate(TargetId=account_id, Filter="SERVICE_CONTROL_POLICY"):
-            for pol in page.get("Policies", []):
-                result["scp_attached"].append(pol)
+            out["scp_attached"].extend(page.get("Policies", []))
 
-        for pol in result["scp_attached"]:
+        for pol in out["scp_attached"]:
             try:
-                d = org.describe_policy(PolicyId=pol["Id"])
-                policy = d.get("Policy", {})
+                desc = org.describe_policy(PolicyId=pol["Id"])
+                policy = desc.get("Policy", {})
                 content = policy.get("Content", "")
-                record = {
+
+                out["scp_details"].append({
                     "id": pol.get("Id"),
                     "name": pol.get("Name"),
                     "description": pol.get("Description"),
                     "content": content
-                }
-                result["scp_details"].append(record)
+                })
 
                 detected, clues = analyze_scp_content(content)
                 if detected:
-                    result["region_restriction_detected"] = True
-                    result["region_restriction_clues"].append({
+                    out["region_restriction_detected"] = True
+                    out["region_restriction_clues"].append({
                         "policy_name": pol.get("Name"),
                         "policy_id": pol.get("Id"),
                         "clues": clues
                     })
 
             except botocore.exceptions.ClientError as e:
-                result["errors"].append(f"{pol.get('Name')}: {short_error(e)}")
+                out["errors"].append(f"{pol.get('Name')}: {short_error(e)}")
 
     except botocore.exceptions.ClientError as e:
-        result["errors"].append(short_error(e))
+        out["errors"].append(short_error(e))
 
-    return result
-
-
-def analyze_scp_content(content):
-    detected = False
-    clues = []
-
-    try:
-        if isinstance(content, str):
-            doc = json.loads(content)
-        else:
-            doc = content
-
-        statements = doc.get("Statement", [])
-        if isinstance(statements, dict):
-            statements = [statements]
-
-        for stmt in statements:
-            cond = stmt.get("Condition", {})
-            stmt_text = json.dumps(stmt).lower()
-
-            if "aws:requestedregion" in stmt_text:
-                detected = True
-                clues.append("Contains aws:RequestedRegion condition")
-
-            if stmt.get("Effect") == "Deny":
-                clues.append("Contains Deny statement")
-
-            if "notaction" in stmt_text:
-                clues.append("Uses NotAction (possible exceptions/bypass for some services)")
-
-            if "arnnotlike" in stmt_text or "stringnotequals" in stmt_text:
-                clues.append("Contains exception-style condition (ArnNotLike/StringNotEquals)")
-
-    except Exception as e:
-        clues.append(f"Failed to parse SCP JSON content: {e}")
-
-    return detected, list(dict.fromkeys(clues))
+    return out
 
 
 # =========================================================
 # REGIONS
 # =========================================================
-def get_all_regions(session):
+def is_region_enabled(opt_in_status):
+    return opt_in_status in {"opted-in", "opt-in-not-required", "manual"}
+
+
+def get_regions(session):
+    if ARGS.regions:
+        return [{"RegionName": r, "OptInStatus": "manual"} for r in sorted(set(ARGS.regions))]
+
     ec2 = safe_client(session, "ec2", region_name="us-east-1")
     resp = ec2.describe_regions(AllRegions=True)
-    regions = []
-    for r in resp.get("Regions", []):
-        regions.append({
-            "RegionName": r.get("RegionName"),
-            "OptInStatus": r.get("OptInStatus", "unknown")
-        })
-    regions.sort(key=lambda x: x["RegionName"])
-    return regions
+
+    all_regions = [{
+        "RegionName": r.get("RegionName"),
+        "OptInStatus": r.get("OptInStatus", "unknown")
+    } for r in resp.get("Regions", [])]
+    all_regions.sort(key=lambda x: x["RegionName"])
+
+    if ARGS.include_disabled_regi
+ons:
+        return all_regions
+
+    return [r for r in all_regions if is_region_enabled(r["OptInStatus"])]
 
 
 # =========================================================
-# SERVICE TESTS
+# TESTS
 # =========================================================
-SERVICE_TESTS = [
-    {"service": "ec2", "method": "describe_instances", "kwargs": {"MaxResults": 5}, "action": "ec2:DescribeInstances"},
-    {"service": "lambda", "method": "list_functions", "kwargs": {"MaxItems": 5}, "action": "lambda:ListFunctions"},
-    {"service": "rds", "method": "describe_db_instances", "kwargs": {"MaxRecords": 20}, "action": "rds:DescribeDBInstances"},
-    {"service": "dynamodb", "method": "list_tables", "kwargs": {"Limit": 10}, "action": "dynamodb:ListTables"},
-    {"service": "ecs", "method": "list_clusters", "kwargs": {"maxResults": 10}, "action": "ecs:ListClusters"},
-    {"service": "eks", "method": "list_clusters", "kwargs": {"maxResults": 10}, "action": "eks:ListClusters"},
-]
+def get_service_tests():
+    fast = [
+        {"service": "ec2", "method": "describe_instances", "kwargs": {"MaxResults": 5}, "action": "ec2:DescribeInstances"},
+        {"service": "lambda", "method": "list_functions", "kwargs": {"MaxItems": 5}, "action": "lambda:ListFunctions"},
+        {"service": "rds", "method": "describe_db_instances", "kwargs": {"MaxRecords": 20}, "action": "rds:DescribeDBInstances"},
+    ]
+
+    full = fast + [
+        {"service": "dynamodb", "method": "list_tables", "kwargs": {"Limit": 10}, "action": "dynamodb:ListTables"},
+        {"service": "ecs", "method": "list_clusters", "kwargs": {"maxResults": 10}, "action": "ecs:ListClusters"},
+        {"service": "eks", "method": "list_clusters", "kwargs": {"maxResults": 10}, "action": "eks:ListClusters"},
+    ]
+
+    return fast if ARGS.mode == "fast" else full
+
+
+SERVICE_TESTS = get_service_tests()
 
 
 def run_service_test(session, region_name, test):
-    service = test["service"]
-    method_name = test["method"]
-    kwargs = test["kwargs"]
-    action = test["action"]
-
-    client = safe_client(session, service, region_name=region_name)
-    method = getattr(client, method_name)
+    client = safe_client(session, test["service"], region_name=region_name)
+    method = getattr(client, test["method"])
 
     try:
-        method(**kwargs)
+        method(**test["kwargs"])
         return {
-            "service": service,
-            "action": action,
+            "service": test["service"],
+            "action": test["action"],
             "status": "ALLOWED",
             "classification": "ALLOWED",
             "error": None
         }
     except botocore.exceptions.ClientError as e:
         return {
-            "service": service,
-            "action": action,
+            "service": test["service"],
+            "action": test["action"],
             "status": "DENIED",
             "classification": classify_error(e),
             "error": short_error(e)
         }
     except Exception as e:
         return {
-            "service": service,
-            "action": action,
+            "service": test["service"],
+            "action": test["action"],
             "status": "ERROR",
             "classification": "OTHER_ERROR",
             "error": str(e)
         }
 
 
-# =========================================================
-# AUDIT
-# =========================================================
-def audit_regions(session, regions):
-    results = []
-    total_steps = len(regions) * len(SERVICE_TESTS)
-
-    iterator = regions
-    if tqdm:
-        iterator = tqdm(total=total_steps, desc="Testing region/service access", unit="check")
-
-    for region in regions:
-        rname = region["RegionName"]
-        opt_in = region["OptInStatus"]
-
-        region_record = {
-            "region": rname,
-            "opt_in_status": opt_in,
-            "is_india_region": rname in {"ap-south-1", "ap-south-2"},
-            "service_results": [],
-            "summary": {
-                "allowed": 0,
-                "denied": 0,
-                "scp_deny": 0,
-                "iam_or_session_deny": 0,
-                "permission_boundary_deny": 0,
-                "session_policy_deny": 0,
-                "region_not_enabled": 0,
-                "other_error": 0
-            }
+def build_region_record(region_name, opt_in_status):
+    return {
+        "region": region_name,
+        "opt_in_status": opt_in_status,
+        "is_india_region": region_name in {"ap-south-1", "ap-south-2"},
+        "service_results": [],
+        "summary": {
+            "allowed": 0,
+            "denied": 0,
+            "scp_deny": 0,
+            "iam_or_session_deny": 0,
+            "permission_boundary_deny": 0,
+            "session_policy_deny": 0,
+            "region_not_enabled": 0,
+            "other_error": 0
         }
+    }
 
-        for test in SERVICE_TESTS:
-            res = run_service_test(session, rname, test)
-            region_record["service_results"].append(res)
+
+def check_region_service(session, region, test):
+    region_name = region["RegionName"]
+    res = run_service_test(session, region_name, test)
+    return region_name, region["OptInStatus"], res
+
+
+def audit_regions_parallel(session, regions, max_workers=10):
+    results_map = {
+        region["RegionName"]: build_region_record(region["RegionName"], region["OptInStatus"])
+        for region in regions
+    }
+
+    total_steps = len(regions) * len(SERVICE_TESTS)
+    pbar = tqdm(total=total_steps, desc="Testing access", unit="check") if tqdm else None
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for region in regions:
+            for test in SERVICE_TESTS:
+                futures.append(executor.submit(check_region_service, session, region, test))
+
+        for future in as_completed(futures):
+            region_name, _, res = future.result()
+            record = results_map[region_name]
+            record["service_results"].append(res)
 
             cls = res["classification"]
             if cls == "ALLOWED":
-                region_record["summary"]["allowed"] += 1
+                record["summary"]["allowed"] += 1
             elif cls == "SCP_DENY":
-                region_record["summary"]["scp_deny"] += 1
-                region_record["summary"]["denied"] += 1
+                record["summary"]["scp_deny"] += 1
+                record["summary"]["denied"] += 1
             elif cls == "IAM_OR_SESSION_DENY":
-                region_record["summary"]["iam_or_session_deny"] += 1
-                region_record["summary"]["denied"] += 1
+                record["summary"]["iam_or_session_deny"] += 1
+                record["summary"]["denied"] += 1
             elif cls == "PERMISSION_BOUNDARY_DENY":
-                region_record["summary"]["permission_boundary_deny"] += 1
-                region_record["summary"]["denied"] += 1
+                record["summary"]["permission_boundary_deny"] += 1
+                record["summary"]["denied"] += 1
             elif cls == "SESSION_POLICY_DENY":
-                region_record["summary"]["session_policy_deny"] += 1
-                region_record["summary"]["denied"] += 1
+                record["summary"]["session_policy_deny"] += 1
+                record["summary"]["denied"] += 1
             elif cls == "REGION_NOT_ENABLED":
-                region_record["summary"]["region_not_enabled"] += 1
+                record["summary"]["region_not_enabled"] += 1
             else:
-                region_record["summary"]["other_error"] += 1
+                record["summary"]["other_error"] += 1
                 if res["status"] != "ALLOWED":
-                    region_record["summary"]["denied"] += 1
+                    record["summary"]["denied"] += 1
 
-            if tqdm:
-                iterator.update(1)
+            if pbar:
+                pbar.update(1)
 
-        results.append(region_record)
+    if pbar:
+        pbar.close()
 
-    if tqdm:
-        iterator.close()
-
+    results = list(results_map.values())
+    for record in results:
+        record["service_results"].sort(key=lambda x: x["service"])
+    results.sort(key=lambda x: x["region"])
     return results
 
 
 # =========================================================
-# ANALYSIS
+# FINDINGS
 # =========================================================
 def derive_findings(identity, iam_info, scp_info, region_results):
     findings = {
         "outside_india_any_access": False,
-        "all_regions_full_read_access": True,
+        "all_tested_regions_full_read_access": True,
         "regions_with_any_access_outside_india": [],
         "regions_fully_blocked_by_scp": [],
         "regions_partially_allowed": [],
@@ -518,13 +562,15 @@ def derive_findings(identity, iam_info, scp_info, region_results):
 
     for rr in region_results:
         region = rr["region"]
-        allowed = rr["summary"]["allowed"]
-        denied = rr["summary"]["denied"]
-        scp_deny = rr["summary"]["scp_deny"]
-        iam_deny = (
-            rr["summary"]["iam_or_session_deny"] +
-            rr["summary"]["permission_boundary_deny"] +
-            rr["summary"]["session_policy_deny"]
+        summary = rr["summary"]
+
+        allowed = summary["allowed"]
+        denied = summary["denied"]
+        scp_deny = summary["scp_deny"]
+        iam_related = (
+            summary["iam_or_session_deny"] +
+            summary["permission_boundary_deny"] +
+            summary["session_policy_deny"]
         )
 
         if region not in {"ap-south-1", "ap-south-2"} and allowed > 0:
@@ -532,7 +578,7 @@ def derive_findings(identity, iam_info, scp_info, region_results):
             findings["regions_with_any_access_outside_india"].append(region)
 
         if allowed != len(SERVICE_TESTS):
-            findings["all_regions_full_read_access"] = False
+            findings["all_tested_regions_full_read_access"] = False
 
         if scp_deny == len(SERVICE_TESTS):
             findings["regions_fully_blocked_by_scp"].append(region)
@@ -540,60 +586,58 @@ def derive_findings(identity, iam_info, scp_info, region_results):
         if allowed > 0 and denied > 0:
             findings["regions_partially_allowed"].append(region)
 
-        if iam_deny > 0:
+        if iam_related > 0:
             findings["regions_denied_by_iam_or_session"].append(region)
 
-    # Heuristic clues
     if scp_info["region_restriction_detected"] and findings["outside_india_any_access"]:
         findings["possible_temporary_access_clues"].append(
-            "SCP appears to contain region restriction logic, but real API access still works in one or more non-India regions."
+            "SCP appears to restrict by region, but some non-India regions still allow real API reads."
         )
         findings["possible_temporary_access_clues"].append(
-            "Likely explanation: SCP uses NotAction or exception conditions, or temporary access is coming from allowed read/list actions that SCP does not block."
-        )
-
-    if iam_info["readonlyaccess_attached"]:
-        findings["possible_temporary_access_clues"].append(
-            "ReadOnlyAccess appears attached/visible on the current principal."
+            "Likely causes: NotAction in SCP, conditional exception logic, or only some actions/services are denied."
         )
 
     if identity["assumed_role"]:
         findings["possible_temporary_access_clues"].append(
-            f"Session is an assumed role session: {identity.get('role_name')}. Temporary access may be granted through this role."
+            f"Current session is an assumed role: {identity.get('role_name')}"
+        )
+
+    if iam_info["readonlyaccess_attached"]:
+        findings["possible_temporary_access_clues"].append(
+            "AWS managed ReadOnlyAccess appears attached to the current user/role."
         )
 
     return findings
 
 
 # =========================================================
-# REPORT FORMATTING
+# REPORTING
 # =========================================================
 def terminal_region_line(rr):
-    region = rr["region"]
-    summ = rr["summary"]
+    s = rr["summary"]
 
-    if summ["allowed"] == len(SERVICE_TESTS):
+    if s["allowed"] == len(SERVICE_TESTS):
         status = c("FULL_READ_OK", GREEN)
-    elif summ["allowed"] > 0 and summ["denied"] > 0:
+    elif s["allowed"] > 0 and s["denied"] > 0:
         status = c("PARTIAL_ACCESS", YELLOW)
-    elif summ["scp_deny"] == len(SERVICE_TESTS):
+    elif s["scp_deny"] == len(SERVICE_TESTS):
         status = c("BLOCKED_BY_SCP", RED)
-    elif summ["region_not_enabled"] == len(SERVICE_TESTS):
-        status = c("REGION_NOT_ENABLED", MAGENTA)
-    elif summ["denied"] == len(SERVICE_TESTS):
+    elif s["region_not_enabled"] == len(SERVICE_TESTS):
+        status = c("REGION_DISABLED", MAGENTA)
+    elif s["denied"] == len(SERVICE_TESTS):
         status = c("DENIED", RED)
     else:
-        status = c("MIXED/UNKNOWN", YELLOW)
+        status = c("MIXED", YELLOW)
 
     india_tag = c("INDIA", CYAN) if rr["is_india_region"] else c("NON-INDIA", GRAY)
 
     return (
-        f"{region:<15} {india_tag:<18} "
-        f"Allowed={summ['allowed']:<2} "
-        f"SCP={summ['scp_deny']:<2} "
-        f"IAM/Session={summ['iam_or_session_deny'] + summ['permission_boundary_deny'] + summ['session_policy_deny']:<2} "
-        f"RegionDisabled={summ['region_not_enabled']:<2} "
-        f"Other={summ['other_error']:<2} "
+        f"{rr['region']:<15} {india_tag:<15} "
+        f"Allowed={s['allowed']:<2} "
+        f"SCP={s['scp_deny']:<2} "
+        f"IAM={s['iam_or_session_deny'] + s['permission_boundary_deny'] + s['session_policy_deny']:<2} "
+        f"Disabled={s['region_not_enabled']:<2} "
+        f"Other={s['other_error']:<2} "
         f"-> {status}"
     )
 
@@ -603,71 +647,67 @@ def build_text_report(identity, iam_info, scp_info, regions, region_results, fin
     lines.append("AWS REGION ACCESS AUDIT REPORT")
     lines.append("=" * 100)
     lines.append("")
-
     lines.append("IDENTITY")
     lines.append("-" * 100)
-    lines.append(f"Account ID        : {identity['account_id']}")
-    lines.append(f"ARN               : {identity['arn']}")
-    lines.append(f"Principal Type    : {identity['principal_type']}")
-    lines.append(f"Assumed Role      : {identity['assumed_role']}")
-    lines.append(f"Role Name         : {identity.get('role_name')}")
-    lines.append(f"User Name         : {identity.get('user_name')}")
-    lines.append(f"Session Name      : {identity.get('session_name')}")
+    lines.append(f"Account ID     : {identity['account_id']}")
+    lines.append(f"ARN            : {identity['arn']}")
+    lines.append(f"Principal Type : {identity['principal_type']}")
+    lines.append(f"Assumed Role   : {identity['assumed_role']}")
+    lines.append(f"Role Name      : {identity.get('role_name')}")
+    lines.append(f"User Name      : {identity.get('user_name')}")
+    lines.append(f"Session Name   : {identity.get('session_name')}")
     lines.append("")
-
-    lines.append("IAM VISIBILITY")
+    lines.append("IAM CLUES")
     lines.append("-" * 100)
-    lines.append(f"IAM metadata visible        : {iam_info['visibility']}")
+    lines.append(f"IAM visible                 : {iam_info['visibility']}")
     lines.append(f"ReadOnlyAccess attached     : {iam_info['readonlyaccess_attached']}")
-    lines.append(f"Managed policies visible    : {[p.get('PolicyName') for p in iam_info['managed_policies']]}")
-    lines.append(f"Inline policies visible     : {iam_info['inline_policies']}")
+    lines.append(f"Managed policies            : {[p.get('PolicyName') for p in iam_info['managed_policies']]}")
+    lines.append(f"Inline policies             : {iam_info['inline_policies']}")
     lines.append(f"Permission boundary         : {iam_info['permission_boundary']}")
     lines.append(f"IAM errors                  : {iam_info['errors']}")
     lines.append("")
-
-    lines.append("SCP / ORGANIZATIONS VISIBILITY")
+    lines.append("SCP CLUES")
     lines.append("-" * 100)
-    lines.append(f"Organizations accessible           : {scp_info['organizations_accessible']}")
-    lines.append(f"SCPs attached                      : {[p.get('Name') for p in scp_info['scp_attached']]}")
-    lines.append(f"Region restriction detected in SCP : {scp_info['region_restriction_detected']}")
-    lines.append(f"SCP errors                         : {scp_info['errors']}")
+    lines.append(f"Organizations accessible    : {scp_info['organizations_accessible']}")
+    lines.append(f"SCPs attached               : {[p.get('Name') for p in scp_info['scp_attached']]}")
+    lines.append(f"Region restriction detected : {scp_info['region_restriction_detected']}")
+    lines.append(f"SCP errors                  : {scp_info['errors']}")
     lines.append("")
-
     if scp_info["region_restriction_clues"]:
-        lines.append("SCP REGION RESTRICTION CLUES")
+        lines.append("SCP REGION CLUES")
         lines.append("-" * 100)
         for clue in scp_info["region_restriction_clues"]:
-            lines.append(f"Policy: {clue['policy_name']} ({clue['policy_id']})")
-            for c1 in clue["clues"]:
-                lines.append(f"  - {c1}")
+            lines.append(f"{clue['policy_name']} ({clue['policy_id']})")
+            for x in clue["clues"]:
+                lines.append(f"  - {x}")
         lines.append("")
-
     lines.append("TOP FINDINGS")
     lines.append("-" * 100)
-    lines.append(f"Any access outside India              : {findings['outside_india_any_access']}")
-    lines.append(f"All regions full read-only access     : {findings['all_regions_full_read_access']}")
-    lines.append(f"Outside-India accessible regions      : {findings['regions_with_any_access_outside_india']}")
-    lines.append(f"Regions fully blocked by SCP          : {findings['regions_fully_blocked_by_scp']}")
-    lines.append(f"Regions partially accessible          : {findings['regions_partially_allowed']}")
-    lines.append(f"Regions denied by IAM/session clues   : {findings['regions_denied_by_iam_or_session']}")
+    lines.append(f"Any non-India access                    : {findings['outside_india_any_access']}")
+    lines.append(f"All tested regions full read access     : {findings['all_tested_regions_full_read_access']}")
+    lines.append(f"Non-India accessible regions            : {findings['regions_with_any_access_outside_india']}")
+    lines.append(f"Regions fully blocked by SCP            : {findings['regions_fully_blocked_by_scp']}")
+    lines.append(f"Regions partially allowed               : {findings['regions_partially_allowed']}")
+    lines.append(f"Regions denied by IAM/session clues     : {findings['regions_denied_by_iam_or_session']}")
     lines.append("Possible temporary access clues:")
     for item in findings["possible_temporary_access_clues"]:
         lines.append(f"  - {item}")
     lines.append("")
-
+    lines.append("TESTED REGIONS")
+    lines.append("-" * 100)
+    lines.append(", ".join([f"{r['RegionName']}({r['OptInStatus']})" for r in regions]))
+    lines.append("")
     lines.append("PER-REGION SUMMARY")
     lines.append("-" * 100)
     for rr in region_results:
-        region = rr["region"]
-        summ = rr["summary"]
+        s = rr["summary"]
         lines.append(
-            f"{region}: Allowed={summ['allowed']}, SCP={summ['scp_deny']}, "
-            f"IAM/Session={summ['iam_or_session_deny'] + summ['permission_boundary_deny'] + summ['session_policy_deny']}, "
-            f"RegionDisabled={summ['region_not_enabled']}, Other={summ['other_error']}"
+            f"{rr['region']}: Allowed={s['allowed']}, SCP={s['scp_deny']}, "
+            f"IAM={s['iam_or_session_deny'] + s['permission_boundary_deny'] + s['session_policy_deny']}, "
+            f"Disabled={s['region_not_enabled']}, Other={s['other_error']}"
         )
     lines.append("")
-
-    lines.append("DETAILED SERVICE RESULTS")
+    lines.append("DETAILED RESULTS")
     lines.append("-" * 100)
     for rr in region_results:
         lines.append(f"[{rr['region']}]")
@@ -677,7 +717,6 @@ def build_text_report(identity, iam_info, scp_info, regions, region_results, fin
                 f"Status={sr['status']:<7} Classification={sr['classification']:<24} Error={sr['error']}"
             )
         lines.append("")
-
     return "\n".join(lines)
 
 
@@ -686,30 +725,33 @@ def build_text_report(identity, iam_info, scp_info, regions, region_results, fin
 # =========================================================
 def main():
     ensure_dir(ARGS.outdir)
-    ts = iso_now()
+    timestamp = iso_now()
+
     session = get_session()
 
     print_section("AWS REGION / SCP / EFFECTIVE ACCESS AUDIT")
-
-    print(c("Starting audit...", CYAN))
+    print(f"Mode                     : {c(ARGS.mode, YELLOW)}")
+    print(f"Workers                  : {c(str(ARGS.workers), YELLOW)}")
+    print(f"Enabled regions only     : {yes_no(not ARGS.include_disabled_regions)}")
+    print(f"Output dir               : {c(ARGS.outdir, GREEN)}")
     if ARGS.role_arn:
-        print(f"Assume role requested: {c(ARGS.role_arn, YELLOW)}")
+        print(f"Assume role              : {c(ARGS.role_arn, YELLOW)}")
 
     identity = get_identity(session)
 
     print_section("CURRENT IDENTITY")
-    print(f"Account ID      : {c(identity['account_id'], GREEN)}")
-    print(f"ARN             : {c(identity['arn'], GREEN)}")
-    print(f"Principal Type  : {c(identity['principal_type'], YELLOW)}")
-    print(f"Assumed Role    : {yes_no(identity['assumed_role'])}")
-    print(f"Role Name       : {identity.get('role_name')}")
-    print(f"User Name       : {identity.get('user_name')}")
-    print(f"Session Name    : {identity.get('session_name')}")
+    print(f"Account ID     : {c(identity['account_id'], GREEN)}")
+    print(f"ARN            : {c(identity['arn'], GREEN)}")
+    print(f"Principal Type : {c(identity['principal_type'], YELLOW)}")
+    print(f"Assumed Role   : {yes_no(identity['assumed_role'])}")
+    print(f"Role Name      : {identity.get('role_name')}")
+    print(f"User Name      : {identity.get('user_name')}")
+    print(f"Session Name   : {identity.get('session_name')}")
 
     iam_info = inspect_iam(session, identity)
     scp_info = inspect_scp(session, identity["account_id"])
-    regions = get_all_regions(session)
-    region_results = audit_regions(session, regions)
+    regions = get_regions(session)
+    region_results = audit_regions_parallel(session, regions, max_workers=ARGS.workers)
     findings = derive_findings(identity, iam_info, scp_info, region_results)
 
     print_section("IAM / SCP CLUES")
@@ -718,37 +760,25 @@ def main():
     print(f"Organizations accessible      : {yes_no(scp_info['organizations_accessible'])}")
     print(f"SCP region restriction found  : {yes_no(scp_info['region_restriction_detected'])}")
 
-    if iam_info["managed_policies"]:
-        print("Managed policies visible:")
-        for p in iam_info["managed_policies"]:
-            print(f"  - {p.get('PolicyName')} ({p.get('PolicyArn')})")
-
-    if iam_info["permission_boundary"]:
-        print(f"Permission boundary: {iam_info['permission_boundary']}")
-
     if scp_info["scp_attached"]:
         print("Attached SCPs:")
         for p in scp_info["scp_attached"]:
             print(f"  - {p.get('Name')} ({p.get('Id')})")
 
-    if scp_info["region_restriction_clues"]:
-        print("\nSCP clues:")
-        for clue in scp_info["region_restriction_clues"]:
-            print(f"  {c(clue['policy_name'], YELLOW)}")
-            for x in clue["clues"]:
-                print(f"    - {x}")
+    print_section("TESTED ENABLED REGIONS")
+    for r in regions:
+        print(f"{r['RegionName']:<15} {r['OptInStatus']}")
 
     print_section("TOP CONCLUSION")
-    print(f"Any access outside India           : {yes_no(findings['outside_india_any_access'])}")
-    print(f"All regions full read-only access  : {yes_no(findings['all_regions_full_read_access'])}")
+    print(f"Any access outside India          : {yes_no(findings['outside_india_any_access'])}")
+    print(f"All tested regions full read ok   : {yes_no(findings['all_tested_regions_full_read_access'])}")
 
     if findings["regions_with_any_access_outside_india"]:
-        print(f"Outside-India regions with some real access: {c(', '.join(findings['regions_with_any_access_outside_india']), YELLOW)}")
-    else:
-        print("Outside-India regions with some real access: None")
+        print("Non-India regions with some real access:")
+        print("  " + c(", ".join(findings["regions_with_any_access_outside_india"]), YELLOW))
 
     if findings["possible_temporary_access_clues"]:
-        print("\nWhy temporary access may still be working:")
+        print("\nPossible explanation for temporary access:")
         for item in findings["possible_temporary_access_clues"]:
             print(f"  - {item}")
 
@@ -756,43 +786,43 @@ def main():
     for rr in region_results:
         print(terminal_region_line(rr))
 
-    print_section("DETAILED FAILURES ONLY")
-    any_failure = False
+    print_section("FAILURES ONLY")
+    has_failures = False
     for rr in region_results:
         failures = [x for x in rr["service_results"] if x["classification"] != "ALLOWED"]
         if failures:
-            any_failure = True
+            has_failures = True
             print(c(f"[{rr['region']}]", BOLD + MAGENTA))
             for sr in failures:
-                print(
-                    f"  {sr['service']:<10} {sr['action']:<28} "
-                    f"{c(sr['classification'], RED if 'DENY' in sr['classification'] else YELLOW)} "
-                    f"| {sr['error']}"
-                )
-    if not any_failure:
-        print(c("No failures detected in tested read-only service probes.", GREEN))
+                print(f"  {sr['service']:<10} {sr['classification']:<24} | {sr['error']}")
+    if not has_failures:
+        print(c("No failures in tested service probes.", GREEN))
 
-    report_data = {
-        "identity": identity,
-        "iam_info": iam_info,
-        "scp_info": scp_info,
-        "regions": regions,
-        "region_results": region_results,
-        "findings": findings,
+    report = {
+        "generated_at_utc": timestamp,
         "script_args": {
             "role_arn": ARGS.role_arn,
             "profile": ARGS.profile,
             "region": ARGS.region,
-            "outdir": ARGS.outdir
+            "outdir": ARGS.outdir,
+            "workers": ARGS.workers,
+            "mode": ARGS.mode,
+            "regions": ARGS.regions,
+            "include_disabled_regions": ARGS.include_disabled_regions,
         },
-        "generated_at_utc": ts
+        "identity": identity,
+        "iam_info": iam_info,
+        "scp_info": scp_info,
+        "tested_regions": regions,
+        "region_results": region_results,
+        "findings": findings,
     }
 
-    json_path = os.path.join(ARGS.outdir, f"audit_report_{ts}.json")
-    txt_path = os.path.join(ARGS.outdir, f"audit_report_{ts}.txt")
-    scp_path = os.path.join(ARGS.outdir, f"scp_dump_{ts}.json")
+    json_path = os.path.join(ARGS.outdir, f"audit_report_{timestamp}.json")
+    txt_path = os.path.join(ARGS.outdir, f"audit_report_{timestamp}.txt")
+    scp_path = os.path.join(ARGS.outdir, f"scp_dump_{timestamp}.json")
 
-    write_json(json_path, report_data)
+    write_json(json_path, report)
     write_text(txt_path, build_text_report(identity, iam_info, scp_info, regions, region_results, findings))
     write_json(scp_path, scp_info)
 
@@ -801,24 +831,12 @@ def main():
     print(f"Text report : {c(txt_path, GREEN)}")
     print(f"SCP dump    : {c(scp_path, GREEN)}")
 
-    print_section("FINAL INTERPRETATION GUIDE")
-    print("Use the result like this:")
-    print(f"  - {c('FULL_READ_OK', GREEN)}        -> tested read/list APIs worked in that region")
-    print(f"  - {c('PARTIAL_ACCESS', YELLOW)}     -> some services work, some are blocked")
-    print(f"  - {c('BLOCKED_BY_SCP', RED)}       -> tested services appear blocked by SCP")
-    print(f"  - {c('IAM_OR_SESSION_DENY', RED)}  -> blocked by role/user/session policy or no permission")
-    print(f"  - {c('REGION_NOT_ENABLED', MAGENTA)} -> account not opted into that region")
-    print("")
-    print("If SCP is active but non-India regions still show ALLOWED or PARTIAL_ACCESS,")
-    print("then access is likely happening because of SCP exceptions, NotAction logic,")
-    print("or because only some actions/services are blocked while read/list calls are still allowed.")
-
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        print("\nInterrupted.")
         sys.exit(130)
     except botocore.exceptions.ClientError as e:
         print(c(f"AWS error: {short_error(e)}", RED))
