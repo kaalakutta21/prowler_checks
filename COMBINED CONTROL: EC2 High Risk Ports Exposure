@@ -6,7 +6,7 @@ import csv
 from tqdm import tqdm
 
 # ==================================================
-# FULL CONTROL MAP (RESTORED)
+# CONTROL MAP (FULL)
 # ==================================================
 
 CONTROL_PORTS = {
@@ -42,49 +42,44 @@ def get_regions(session):
 
 
 def is_public(rule):
-
     for ip in rule.get("IpRanges", []):
         if ip.get("CidrIp") == "0.0.0.0/0":
             return True
-
     for ip in rule.get("Ipv6Ranges", []):
         if ip.get("CidrIpv6") == "::/0":
             return True
-
     return False
 
 
 def match_port(rule, port):
 
     proto = rule.get("IpProtocol")
-
-    # ALL PORTS / ALL PROTOCOLS
-    if proto == "-1":
-        return True, "ALL_PORTS"
-
-    if proto != "tcp":
-        return False, None
-
     from_port = rule.get("FromPort")
     to_port = rule.get("ToPort")
 
-    if from_port is None or to_port is None:
-        return False, None
+    # CASE 1: TCP specific ports
+    if proto == "tcp":
+        if from_port is not None and to_port is not None:
+            if from_port <= port <= to_port:
+                return True, "SPECIFIC_PORT"
 
-    if from_port <= port <= to_port:
-        return True, "SPECIFIC_PORT"
+    # CASE 2: ALL protocols
+    if proto == "-1":
+
+        # If ports are NOT defined → truly all ports open
+        if from_port is None and to_port is None:
+            return True, "ALL_PORTS"
+
+        # If AWS gives range with -1 (rare but possible)
+        if from_port is not None and to_port is not None:
+            if from_port <= port <= to_port:
+                return True, "ALL_PORTS"
 
     return False, None
 
 
-# ==================================================
-# SAFE INSTANCE FETCH
-# ==================================================
-
 def get_all_instances(ec2):
-
     instances = []
-
     paginator = ec2.get_paginator("describe_instances")
 
     for page in paginator.paginate():
@@ -119,7 +114,6 @@ def scan(session):
             for sg in page["SecurityGroups"]:
                 sg_map[sg["GroupId"]] = sg
 
-        # Load ALL instances
         instances = get_all_instances(ec2)
 
         print(f"{region} → Instances: {len(instances)}")
@@ -131,7 +125,7 @@ def scan(session):
             instance_id = inst["InstanceId"]
             arn = f"arn:aws:ec2:{region}:{account}:instance/{instance_id}"
 
-            # SG extraction (both methods)
+            # Collect SGs (both methods)
             sg_ids = []
 
             for eni in inst.get("NetworkInterfaces", []):
@@ -182,7 +176,7 @@ def scan(session):
 
 def write_csv(account, results):
 
-    file = f"ec2_sg_full_findings_{account}.csv"
+    file = f"ec2_sg_correct_findings_{account}.csv"
 
     with open(file, "w", newline="") as f:
 
