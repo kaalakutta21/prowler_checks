@@ -39,30 +39,42 @@ def get_regions(session):
             if r["OptInStatus"] in ["opt-in-not-required","opted-in"]]
 
 def is_public(rule):
+
     for ip in rule.get("IpRanges", []):
         if ip.get("CidrIp") == "0.0.0.0/0":
             return True
+
     for ip in rule.get("Ipv6Ranges", []):
         if ip.get("CidrIpv6") == "::/0":
             return True
+
     return False
 
-def matches_port(rule, port):
+
+def rule_matches_control(rule, ports):
+
     proto = rule.get("IpProtocol")
 
+    # 🔥 CRITICAL FIX: ALL PROTOCOLS
     if proto == "-1":
         return True
 
     if proto != "tcp":
         return False
 
-    fp = rule.get("FromPort")
-    tp = rule.get("ToPort")
+    from_port = rule.get("FromPort")
+    to_port = rule.get("ToPort")
 
-    if fp is None or tp is None:
+    # 🔥 FIX: handle None properly
+    if from_port is None or to_port is None:
         return False
 
-    return fp <= port <= tp
+    for port in ports:
+        if from_port <= port <= to_port:
+            return True
+
+    return False
+
 
 # ==================================================
 # MAIN LOGIC
@@ -95,7 +107,6 @@ def scan(session):
                     instance_id = inst["InstanceId"]
                     arn = f"arn:aws:ec2:{region}:{account}:instance/{instance_id}"
 
-                    # Collect SGs from ENIs
                     sg_ids = []
                     for eni in inst.get("NetworkInterfaces", []):
                         for g in eni.get("Groups", []):
@@ -103,7 +114,6 @@ def scan(session):
 
                     instance_findings = {control: False for control in CONTROL_PORTS}
 
-                    # Evaluate rules
                     for sg_id in sg_ids:
 
                         sg = sg_map.get(sg_id)
@@ -116,21 +126,19 @@ def scan(session):
                                 continue
 
                             for control, ports in CONTROL_PORTS.items():
-                                for port in ports:
-                                    if matches_port(rule, port):
-                                        instance_findings[control] = True
 
-                    # Final result per control
+                                if rule_matches_control(rule, ports):
+                                    instance_findings[control] = True
+
+                    # FINAL STATUS
                     for control in CONTROL_PORTS:
-
-                        status = "NON_COMPLIANT" if instance_findings[control] else "COMPLIANT"
 
                         results.append({
                             "Region": region,
                             "InstanceId": instance_id,
                             "InstanceArn": arn,
                             "Control": control,
-                            "Status": status
+                            "Status": "NON_COMPLIANT" if instance_findings[control] else "COMPLIANT"
                         })
 
     return results, total_instances
@@ -142,7 +150,7 @@ def scan(session):
 
 def write_csv(account, results):
 
-    file = f"final_all_instances_sg_audit_{account}.csv"
+    file = f"fixed_ec2_sg_controls_{account}.csv"
 
     with open(file, "w", newline="") as f:
 
@@ -174,7 +182,7 @@ def main():
         sts = session.client("sts")
         creds = sts.assume_role(
             RoleArn=args.role_arn,
-            RoleSessionName="sg-final"
+            RoleSessionName="sg-fixed"
         )["Credentials"]
 
         session = boto3.Session(
