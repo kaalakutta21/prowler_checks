@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+import json
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="dynamodb-cross-account-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r.get("OptInStatus") in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# POLICY ANALYSIS (FIXED)
+# ==================================================
+
+def analyze_policy(policy_str, account_id):
+
+    try:
+        policy = json.loads(policy_str)
+    except Exception:
+        return False, "Invalid policy JSON"
+
+    statements = policy.get("Statement", [])
+
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    findings = []
+
+    for stmt in statements:
+
+        effect = stmt.get("Effect", "Deny")
+
+        if effect != "Allow":
+            continue
+
+        principal = stmt.get("Principal")
+
+        # ---------- PUBLIC ----------
+        if principal == "*":
+            return True, "Public access (*)"
+
+        # ---------- STRUCTURED PRINCIPAL ----------
+        if isinstance(principal, dict):
+
+            aws_principal = principal.get("AWS")
+
+            if isinstance(aws_principal, str):
+
+                if account_id not in aws_principal:
+                    findings.append(aws_principal)
+
+            elif isinstance(aws_principal, list):
+
+                for p in aws_principal:
+                    if account_id not in p:
+                        findings.append(p)
+
+    if findings:
+        return True, f"Cross-account: {', '.join(findings[:3])}"
+
+    return False, "No cross-account access"
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_dynamodb_cross_account(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total = 0
+    non_compliant = 0
+    skipped_regions = 0
+    skipped_tables = 0
+
+    account_id = get_account_id(session)
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+            dynamodb = session.client("dynamodb", region_name=region)
+            paginator = dynamodb.get_paginator("list_tables")
+
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+
+            if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                print(f"Skipping region {region} (SCP Denied)")
+                skipped_regions += 1
+                continue
+            else:
+                continue
+
+        # ==================================================
+        # SCAN TABLES
+        # ==================================================
+        try:
+            for page in paginator.paginate():
+
+                for table_name in page.get("TableNames", []):
+
+                    arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}"
+
+                    policy = None
+
+                    # ---------- GET POLICY ----------
+                    try:
+                        resp = dynamodb.get_resource_policy(
+                            ResourceArn=arn
+                        )
+
+                        policy = resp.get("Policy")
+
+                    except ClientError as e:
+                        code = e.response["Error"]["Code"]
+
+                        # No policy → SAFE
+                        if code in ["PolicyNotFoundException", "ResourceNotFoundException"]:
+                            policy = None
+
+                        elif code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                            skipped_tables += 1
+
+                            results.append({
+                                "Region": region,
+                                "TableName": table_name,
+                                "TableArn": arn,
+                                "Status": "SKIPPED",
+                                "Reason": "Access Denied (SCP/IAM)"
+                            })
+                            continue
+                        else:
+                            continue
+
+                    total += 1
+
+                    # ---------- LOGIC ----------
+                    if not policy:
+                        status = "COMPLIANT"
+                        reason = "No resource policy"
+
+                    else:
+                        is_bad, reason = analyze_policy(policy, account_id)
+
+                        if is_bad:
+                            status = "NON_COMPLIANT"
+                            non_compliant += 1
+                        else:
+                            status = "COMPLIANT"
+
+                    results.append({
+                        "Region": region,
+                        "TableName": table_name,
+                        "TableArn": arn,
+                        "Status": status,
+                        "Reason": reason
+                    })
+
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+
+            if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                print(f"Skipping region {region} during pagination (SCP Denied)")
+                skipped_regions += 1
+                continue
+            else:
+                continue
+
+    compliant = total - non_compliant
+
+    return results, total, compliant, non_compliant, skipped_tables, skipped_regions
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"dynamodb_cross_account_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "TableName",
+            "TableArn",
+            "Status",
+            "Reason"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Check DynamoDB cross-account access (fixed)"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total, compliant, non_compliant, skipped_tables, skipped_regions = \
+        check_dynamodb_cross_account(session)
+
+    print("\n====================================================")
+    print("CONTROL: DynamoDB Cross Account Access")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Tables Checked     : {total}")
+    print(f"Compliant                : {compliant}")
+    print(f"Non-Compliant            : {non_compliant}")
+    print(f"Skipped Tables           : {skipped_tables}")
+    print(f"Skipped Regions (SCP)    : {skipped_regions}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
