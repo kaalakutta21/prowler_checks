@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="s3-encryption-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_s3_encryption(session):
+
+    s3 = session.client("s3")
+
+    results = []
+    total = 0
+    non_compliant = 0
+    skipped = 0
+
+    print("\nFetching S3 Buckets...\n")
+
+    try:
+        buckets = s3.list_buckets()["Buckets"]
+    except ClientError:
+        print("Unable to list buckets")
+        return [], 0, 0, 0, 0
+
+    for bucket in tqdm(buckets, desc="Checking Buckets"):
+
+        bucket_name = bucket["Name"]
+        total += 1
+
+        arn = f"arn:aws:s3:::{bucket_name}"
+
+        encryption_type = "NONE"
+        status = "NON_COMPLIANT"
+        reason = "No encryption configured"
+
+        try:
+            resp = s3.get_bucket_encryption(Bucket=bucket_name)
+
+            rules = resp.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])
+
+            if rules:
+
+                algo = rules[0].get("ApplyServerSideEncryptionByDefault", {}).get("SSEAlgorithm")
+
+                if algo == "AES256":
+                    encryption_type = "SSE-S3 (AES256)"
+                    status = "COMPLIANT"
+                    reason = "AWS managed encryption"
+
+                elif algo == "aws:kms":
+                    encryption_type = "SSE-KMS"
+                    status = "COMPLIANT"
+                    reason = "KMS encryption"
+
+                else:
+                    encryption_type = algo or "UNKNOWN"
+                    status = "COMPLIANT"
+                    reason = "Encryption enabled (unknown type)"
+
+        except ClientError as e:
+
+            code = e.response["Error"]["Code"]
+
+            if code == "ServerSideEncryptionConfigurationNotFoundError":
+                # Expected case → NON_COMPLIANT
+                pass
+
+            elif code in ["AccessDenied", "AllAccessDisabled"]:
+                skipped += 1
+                status = "SKIPPED"
+                reason = "Access denied"
+
+            else:
+                skipped += 1
+                status = "SKIPPED"
+                reason = code
+
+        if status == "NON_COMPLIANT":
+            non_compliant += 1
+
+        results.append({
+            "BucketName": bucket_name,
+            "BucketArn": arn,
+            "EncryptionType": encryption_type,
+            "Status": status,
+            "Reason": reason
+        })
+
+    compliant = total - non_compliant
+
+    return results, total, compliant, non_compliant, skipped
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"s3_encryption_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "BucketName",
+            "BucketArn",
+            "EncryptionType",
+            "Status",
+            "Reason"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Check S3 bucket encryption (SSE-S3 / SSE-KMS)"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total, compliant, non_compliant, skipped = \
+        check_s3_encryption(session)
+
+    print("\n====================================================")
+    print("CONTROL: S3 Bucket Encryption Enabled")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Buckets        : {total}")
+    print(f"Compliant            : {compliant}")
+    print(f"Non-Compliant        : {non_compliant}")
+    print(f"Skipped              : {skipped}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
