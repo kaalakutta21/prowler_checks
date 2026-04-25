@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="rds-backup-audit"
+        )
+
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r.get("OptInStatus") in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_rds_backup(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total = 0
+    non_compliant = 0
+    skipped_regions = 0
+
+    account_id = get_account_id(session)
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+            rds = session.client("rds", region_name=region)
+
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+
+            if code in ["AccessDeniedException", "UnauthorizedOperation"]:
+                print(f"Skipping region {region} (SCP Denied)")
+                skipped_regions += 1
+                continue
+            else:
+                continue
+
+        # ==================================================
+        # AURORA CLUSTERS
+        # ==================================================
+        try:
+            paginator = rds.get_paginator("describe_db_clusters")
+
+            for page in paginator.paginate():
+
+                for cluster in page.get("DBClusters", []):
+
+                    total += 1
+
+                    cluster_id = cluster["DBClusterIdentifier"]
+                    arn = cluster.get("DBClusterArn", "")
+                    retention = cluster.get("BackupRetentionPeriod", 0)
+
+                    if retention and retention > 0:
+                        status = "COMPLIANT"
+                        reason = f"Retention {retention} days"
+                    else:
+                        status = "NON_COMPLIANT"
+                        reason = "No automated backups"
+                        non_compliant += 1
+
+                    results.append({
+                        "Region": region,
+                        "ResourceType": "AURORA_CLUSTER",
+                        "ResourceId": cluster_id,
+                        "ResourceArn": arn,
+                        "BackupRetentionPeriod": retention,
+                        "Status": status,
+                        "Reason": reason
+                    })
+
+        except ClientError:
+            pass
+
+        # ==================================================
+        # NON-AURORA INSTANCES
+        # ==================================================
+        try:
+            paginator = rds.get_paginator("describe_db_instances")
+
+            for page in paginator.paginate():
+
+                for db in page.get("DBInstances", []):
+
+                    engine = db.get("Engine", "")
+
+                    # Skip Aurora instances (handled above)
+                    if "aurora" in engine:
+                        continue
+
+                    total += 1
+
+                    db_id = db["DBInstanceIdentifier"]
+                    arn = db.get("DBInstanceArn", "")
+                    retention = db.get("BackupRetentionPeriod", 0)
+
+                    if retention and retention > 0:
+                        status = "COMPLIANT"
+                        reason = f"Retention {retention} days"
+                    else:
+                        status = "NON_COMPLIANT"
+                        reason = "No automated backups"
+                        non_compliant += 1
+
+                    results.append({
+                        "Region": region,
+                        "ResourceType": "RDS_INSTANCE",
+                        "ResourceId": db_id,
+                        "ResourceArn": arn,
+                        "BackupRetentionPeriod": retention,
+                        "Status": status,
+                        "Reason": reason
+                    })
+
+        except ClientError:
+            pass
+
+    compliant = total - non_compliant
+
+    return results, total, compliant, non_compliant, skipped_regions
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"rds_backup_retention_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "ResourceType",
+            "ResourceId",
+            "ResourceArn",
+            "BackupRetentionPeriod",
+            "Status",
+            "Reason"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Check RDS automated backup retention (Aurora + Non-Aurora)"
+    )
+
+    parser.add_argument("-R", "--role-arn", help="Role ARN")
+
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total, compliant, non_compliant, skipped_regions = \
+        check_rds_backup(session)
+
+    print("\n====================================================")
+    print("CONTROL: RDS Automated Backup Retention")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Resources Checked : {total}")
+    print(f"Compliant               : {compliant}")
+    print(f"Non-Compliant           : {non_compliant}")
+    print(f"Skipped Regions (SCP)   : {skipped_regions}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Report Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
