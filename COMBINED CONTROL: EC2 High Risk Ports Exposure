@@ -63,11 +63,9 @@ def is_all_ports(rule):
     from_port = rule.get("FromPort")
     to_port = rule.get("ToPort")
 
-    # Case 1: All traffic
     if proto == "-1" and from_port is None and to_port is None:
         return True
 
-    # Case 2: Full TCP range
     if proto == "tcp" and from_port == 0 and to_port == 65535:
         return True
 
@@ -75,7 +73,7 @@ def is_all_ports(rule):
 
 
 # ==================================================
-# MAIN LOGIC (SG FIRST - CORRECT)
+# MAIN LOGIC
 # ==================================================
 
 def check_all_ports(session):
@@ -85,7 +83,7 @@ def check_all_ports(session):
 
     results = []
     total_instances = 0
-    findings = 0
+    non_compliant_count = 0
 
     print(f"\nRegions to Scan: {len(regions)}\n")
 
@@ -93,33 +91,13 @@ def check_all_ports(session):
 
         ec2 = session.client("ec2", region_name=region)
 
-        # 1️⃣ Get all SGs
+        # Load SGs
         sg_map = {}
         for page in ec2.get_paginator("describe_security_groups").paginate():
             for sg in page["SecurityGroups"]:
                 sg_map[sg["GroupId"]] = sg
 
-        # 2️⃣ Find BAD SGs
-        bad_sgs = {}
-
-        for sg_id, sg in sg_map.items():
-
-            for rule in sg.get("IpPermissions", []):
-
-                if not is_public(rule):
-                    continue
-
-                if not is_all_ports(rule):
-                    continue
-
-                # Save evidence ONCE per SG
-                bad_sgs[sg_id] = {
-                    "Protocol": rule.get("IpProtocol"),
-                    "FromPort": rule.get("FromPort"),
-                    "ToPort": rule.get("ToPort")
-                }
-
-        # 3️⃣ Get instances
+        # Load instances
         instances = []
         for page in ec2.get_paginator("describe_instances").paginate():
             for res in page.get("Reservations", []):
@@ -128,7 +106,6 @@ def check_all_ports(session):
 
         print(f"{region} → Instances: {len(instances)}")
 
-        # 4️⃣ Map SG → instances
         for inst in instances:
 
             total_instances += 1
@@ -147,28 +124,43 @@ def check_all_ports(session):
             for g in inst.get("SecurityGroups", []):
                 sg_ids.add(g["GroupId"])
 
-            # 5️⃣ Check if any SG is bad
+            instance_status = "COMPLIANT"
+            evidence = ""
+
             for sg_id in sg_ids:
 
-                if sg_id in bad_sgs:
+                sg = sg_map.get(sg_id)
+                if not sg:
+                    continue
 
-                    findings += 1
+                for rule in sg.get("IpPermissions", []):
 
-                    rule = bad_sgs[sg_id]
+                    if not is_public(rule):
+                        continue
 
-                    results.append({
-                        "Region": region,
-                        "InstanceId": instance_id,
-                        "InstanceArn": arn,
-                        "SecurityGroupId": sg_id,
-                        "RuleProtocol": rule["Protocol"],
-                        "FromPort": rule["FromPort"],
-                        "ToPort": rule["ToPort"],
-                        "Status": "NON_COMPLIANT",
-                        "Reason": "SG allows ALL ports from internet"
-                    })
+                    if not is_all_ports(rule):
+                        continue
 
-    return results, total_instances, findings
+                    # NON-COMPLIANT found
+                    instance_status = "NON_COMPLIANT"
+                    non_compliant_count += 1
+
+                    evidence = f"SG {sg_id} allows ALL ports to internet"
+
+                    break
+
+                if instance_status == "NON_COMPLIANT":
+                    break
+
+            results.append({
+                "Region": region,
+                "InstanceId": instance_id,
+                "InstanceArn": arn,
+                "Status": instance_status,
+                "Evidence": evidence if evidence else "No public all-port exposure"
+            })
+
+    return results, total_instances, non_compliant_count
 
 
 # ==================================================
@@ -177,7 +169,7 @@ def check_all_ports(session):
 
 def write_csv(account_id, results):
 
-    filename = f"ec2_all_ports_FINAL_{account_id}.csv"
+    filename = f"ec2_all_ports_with_compliance_{account_id}.csv"
 
     with open(filename, "w", newline="") as f:
 
@@ -186,12 +178,8 @@ def write_csv(account_id, results):
             "Region",
             "InstanceId",
             "InstanceArn",
-            "SecurityGroupId",
-            "RuleProtocol",
-            "FromPort",
-            "ToPort",
             "Status",
-            "Reason"
+            "Evidence"
         ])
 
         writer.writeheader()
@@ -212,7 +200,7 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="FINAL EC2 ALL PORTS EXPOSURE CHECK (Correct)"
+        description="EC2 ALL PORTS exposure check with COMPLIANT + NON-COMPLIANT"
     )
 
     parser.add_argument("-R", "--role-arn")
@@ -221,7 +209,9 @@ def main():
     session = get_session(args.role_arn)
     account_id = get_account_id(session)
 
-    results, total_instances, findings = check_all_ports(session)
+    results, total_instances, non_compliant = check_all_ports(session)
+
+    compliant = total_instances - non_compliant
 
     print("\n====================================================")
     print("CONTROL: EC2 ALL PORTS EXPOSURE (FINAL)")
@@ -229,9 +219,10 @@ def main():
     print("====================================================\n")
 
     print(f"Total Instances Checked : {total_instances}")
-    print(f"Findings                : {findings}")
+    print(f"Compliant               : {compliant}")
+    print(f"Non-Compliant           : {non_compliant}")
 
-    overall = "COMPLIANT" if findings == 0 else "NON_COMPLIANT"
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
 
     print(f"\nOVERALL STATUS: {overall}")
     print("====================================================\n")
