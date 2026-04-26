@@ -11,17 +11,12 @@ from botocore.exceptions import ClientError
 # ==================================================
 
 def get_session(role_arn=None):
-
     if role_arn:
-        base = boto3.Session()
-        sts = base.client("sts")
-
-        assumed = sts.assume_role(
+        sts = boto3.client("sts")
+        creds = sts.assume_role(
             RoleArn=role_arn,
             RoleSessionName="ec2-all-ports-audit"
-        )
-
-        creds = assumed["Credentials"]
+        )["Credentials"]
 
         return boto3.Session(
             aws_access_key_id=creds["AccessKeyId"],
@@ -41,15 +36,12 @@ def get_account_id(session):
 # ==================================================
 
 def get_regions(session):
-
     ec2 = session.client("ec2", region_name="us-east-1")
-
-    regions = ec2.describe_regions(AllRegions=True)["Regions"]
 
     return [
         r["RegionName"]
-        for r in regions
-        if r.get("OptInStatus") in ["opt-in-not-required", "opted-in"]
+        for r in ec2.describe_regions(AllRegions=True)["Regions"]
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
     ]
 
 
@@ -59,10 +51,12 @@ def get_regions(session):
 
 def is_public(rule):
 
+    # IPv4
     for ip in rule.get("IpRanges", []):
         if ip.get("CidrIp") == "0.0.0.0/0":
             return True
 
+    # IPv6
     for ip in rule.get("Ipv6Ranges", []):
         if ip.get("CidrIpv6") == "::/0":
             return True
@@ -76,7 +70,7 @@ def is_all_ports(rule):
     from_port = rule.get("FromPort")
     to_port = rule.get("ToPort")
 
-    # Case 1: ALL protocols → all ports
+    # Case 1: ALL protocols
     if proto == "-1":
         return True
 
@@ -89,17 +83,15 @@ def is_all_ports(rule):
 
 
 # ==================================================
-# SAFE INSTANCE FETCH
+# INSTANCE FETCH
 # ==================================================
 
 def get_all_instances(ec2):
 
     instances = []
-
     paginator = ec2.get_paginator("describe_instances")
 
     for page in paginator.paginate():
-
         for res in page.get("Reservations", []):
             for inst in res.get("Instances", []):
                 instances.append(inst)
@@ -108,17 +100,16 @@ def get_all_instances(ec2):
 
 
 # ==================================================
-# CONTROL LOGIC
+# MAIN LOGIC
 # ==================================================
 
-def check_ec2_all_ports(session):
+def check_all_ports(session):
 
     regions = get_regions(session)
 
     results = []
     total_instances = 0
     findings = 0
-    skipped_regions = 0
 
     account_id = get_account_id(session)
 
@@ -126,19 +117,15 @@ def check_ec2_all_ports(session):
 
     for region in tqdm(regions, desc="Scanning Regions"):
 
-        try:
-            ec2 = session.client("ec2", region_name=region)
+        ec2 = session.client("ec2", region_name=region)
 
-        except ClientError:
-            skipped_regions += 1
-            continue
-
-        # Load SGs
+        # Load all SGs
         sg_map = {}
         for page in ec2.get_paginator("describe_security_groups").paginate():
             for sg in page.get("SecurityGroups", []):
                 sg_map[sg["GroupId"]] = sg
 
+        # Load all instances
         instances = get_all_instances(ec2)
 
         print(f"{region} → Instances: {len(instances)}")
@@ -150,7 +137,7 @@ def check_ec2_all_ports(session):
             instance_id = inst["InstanceId"]
             arn = f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}"
 
-            # SG extraction (ENI + fallback)
+            # Collect SGs (ENI + fallback)
             sg_ids = []
 
             for eni in inst.get("NetworkInterfaces", []):
@@ -160,6 +147,7 @@ def check_ec2_all_ports(session):
             for g in inst.get("SecurityGroups", []):
                 sg_ids.append(g["GroupId"])
 
+            # Evaluate each SG rule independently
             for sg_id in sg_ids:
 
                 sg = sg_map.get(sg_id)
@@ -168,14 +156,19 @@ def check_ec2_all_ports(session):
 
                 for rule in sg.get("IpPermissions", []):
 
-                    # Must be public
+                    proto = rule.get("IpProtocol")
+                    from_port = rule.get("FromPort")
+                    to_port = rule.get("ToPort")
+
+                    # Step 1: Must be public
                     if not is_public(rule):
                         continue
 
-                    # Must be ALL PORTS
+                    # Step 2: Must be ALL PORTS
                     if not is_all_ports(rule):
                         continue
 
+                    # Step 3: Record finding immediately
                     findings += 1
 
                     results.append({
@@ -183,14 +176,14 @@ def check_ec2_all_ports(session):
                         "InstanceId": instance_id,
                         "InstanceArn": arn,
                         "SecurityGroupId": sg_id,
-                        "RuleProtocol": rule.get("IpProtocol"),
-                        "FromPort": rule.get("FromPort"),
-                        "ToPort": rule.get("ToPort"),
+                        "RuleProtocol": proto,
+                        "FromPort": from_port,
+                        "ToPort": to_port,
                         "Status": "NON_COMPLIANT",
                         "Reason": "Public access to ALL ports"
                     })
 
-    return results, total_instances, findings, skipped_regions
+    return results, total_instances, findings
 
 
 # ==================================================
@@ -199,11 +192,11 @@ def check_ec2_all_ports(session):
 
 def write_csv(account_id, results):
 
-    filename = f"ec2_all_ports_exposure_{account_id}.csv"
+    filename = f"ec2_all_ports_correct_{account_id}.csv"
 
     with open(filename, "w", newline="") as f:
 
-        fields = [
+        writer = csv.DictWriter(f, fieldnames=[
             "Account",
             "Region",
             "InstanceId",
@@ -214,9 +207,8 @@ def write_csv(account_id, results):
             "ToPort",
             "Status",
             "Reason"
-        ]
+        ])
 
-        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
 
         for r in results:
@@ -235,27 +227,24 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Ensure no EC2 instances allow ingress from internet to ALL ports"
+        description="Check EC2 ALL ports exposure correctly"
     )
 
     parser.add_argument("-R", "--role-arn", help="Role ARN")
-
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
     account_id = get_account_id(session)
 
-    results, total_instances, findings, skipped_regions = \
-        check_ec2_all_ports(session)
+    results, total_instances, findings = check_all_ports(session)
 
     print("\n====================================================")
-    print("CONTROL: EC2 All Ports Exposure")
+    print("CONTROL: EC2 ALL PORTS EXPOSURE")
     print(f"ACCOUNT: {account_id}")
     print("====================================================\n")
 
     print(f"Total Instances Checked : {total_instances}")
     print(f"Findings (Non-Compliant): {findings}")
-    print(f"Skipped Regions         : {skipped_regions}")
 
     overall = "COMPLIANT" if findings == 0 else "NON_COMPLIANT"
 
@@ -264,7 +253,7 @@ def main():
 
     csv_file = write_csv(account_id, results)
 
-    print(f"CSV Report Generated: {csv_file}\n")
+    print(f"CSV Generated: {csv_file}\n")
 
 
 if __name__ == "__main__":
