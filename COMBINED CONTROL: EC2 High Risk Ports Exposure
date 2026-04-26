@@ -4,7 +4,6 @@ import boto3
 import argparse
 import csv
 from tqdm import tqdm
-from botocore.exceptions import ClientError
 
 # ==================================================
 # AUTH
@@ -15,7 +14,7 @@ def get_session(role_arn=None):
         sts = boto3.client("sts")
         creds = sts.assume_role(
             RoleArn=role_arn,
-            RoleSessionName="ec2-all-ports-audit"
+            RoleSessionName="ec2-all-ports-final"
         )["Credentials"]
 
         return boto3.Session(
@@ -23,7 +22,6 @@ def get_session(role_arn=None):
             aws_secret_access_key=creds["SecretAccessKey"],
             aws_session_token=creds["SessionToken"]
         )
-
     return boto3.Session()
 
 
@@ -37,7 +35,6 @@ def get_account_id(session):
 
 def get_regions(session):
     ec2 = session.client("ec2", region_name="us-east-1")
-
     return [
         r["RegionName"]
         for r in ec2.describe_regions(AllRegions=True)["Regions"]
@@ -50,13 +47,10 @@ def get_regions(session):
 # ==================================================
 
 def is_public(rule):
-
-    # IPv4
     for ip in rule.get("IpRanges", []):
         if ip.get("CidrIp") == "0.0.0.0/0":
             return True
 
-    # IPv6
     for ip in rule.get("Ipv6Ranges", []):
         if ip.get("CidrIpv6") == "::/0":
             return True
@@ -65,53 +59,33 @@ def is_public(rule):
 
 
 def is_all_ports(rule):
-
     proto = rule.get("IpProtocol")
     from_port = rule.get("FromPort")
     to_port = rule.get("ToPort")
 
-    # Case 1: ALL protocols
-    if proto == "-1":
+    # Case 1: All traffic
+    if proto == "-1" and from_port is None and to_port is None:
         return True
 
     # Case 2: Full TCP range
-    if proto == "tcp":
-        if from_port == 0 and to_port == 65535:
-            return True
+    if proto == "tcp" and from_port == 0 and to_port == 65535:
+        return True
 
     return False
 
 
 # ==================================================
-# INSTANCE FETCH
-# ==================================================
-
-def get_all_instances(ec2):
-
-    instances = []
-    paginator = ec2.get_paginator("describe_instances")
-
-    for page in paginator.paginate():
-        for res in page.get("Reservations", []):
-            for inst in res.get("Instances", []):
-                instances.append(inst)
-
-    return instances
-
-
-# ==================================================
-# MAIN LOGIC
+# MAIN LOGIC (SG FIRST - CORRECT)
 # ==================================================
 
 def check_all_ports(session):
 
     regions = get_regions(session)
+    account_id = get_account_id(session)
 
     results = []
     total_instances = 0
     findings = 0
-
-    account_id = get_account_id(session)
 
     print(f"\nRegions to Scan: {len(regions)}\n")
 
@@ -119,17 +93,42 @@ def check_all_ports(session):
 
         ec2 = session.client("ec2", region_name=region)
 
-        # Load all SGs
+        # 1️⃣ Get all SGs
         sg_map = {}
         for page in ec2.get_paginator("describe_security_groups").paginate():
-            for sg in page.get("SecurityGroups", []):
+            for sg in page["SecurityGroups"]:
                 sg_map[sg["GroupId"]] = sg
 
-        # Load all instances
-        instances = get_all_instances(ec2)
+        # 2️⃣ Find BAD SGs
+        bad_sgs = {}
+
+        for sg_id, sg in sg_map.items():
+
+            for rule in sg.get("IpPermissions", []):
+
+                if not is_public(rule):
+                    continue
+
+                if not is_all_ports(rule):
+                    continue
+
+                # Save evidence ONCE per SG
+                bad_sgs[sg_id] = {
+                    "Protocol": rule.get("IpProtocol"),
+                    "FromPort": rule.get("FromPort"),
+                    "ToPort": rule.get("ToPort")
+                }
+
+        # 3️⃣ Get instances
+        instances = []
+        for page in ec2.get_paginator("describe_instances").paginate():
+            for res in page.get("Reservations", []):
+                for inst in res.get("Instances", []):
+                    instances.append(inst)
 
         print(f"{region} → Instances: {len(instances)}")
 
+        # 4️⃣ Map SG → instances
         for inst in instances:
 
             total_instances += 1
@@ -137,50 +136,36 @@ def check_all_ports(session):
             instance_id = inst["InstanceId"]
             arn = f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}"
 
-            # Collect SGs (ENI + fallback)
-            sg_ids = []
+            sg_ids = set()
 
+            # ENI SGs
             for eni in inst.get("NetworkInterfaces", []):
                 for g in eni.get("Groups", []):
-                    sg_ids.append(g["GroupId"])
+                    sg_ids.add(g["GroupId"])
 
+            # fallback
             for g in inst.get("SecurityGroups", []):
-                sg_ids.append(g["GroupId"])
+                sg_ids.add(g["GroupId"])
 
-            # Evaluate each SG rule independently
+            # 5️⃣ Check if any SG is bad
             for sg_id in sg_ids:
 
-                sg = sg_map.get(sg_id)
-                if not sg:
-                    continue
+                if sg_id in bad_sgs:
 
-                for rule in sg.get("IpPermissions", []):
-
-                    proto = rule.get("IpProtocol")
-                    from_port = rule.get("FromPort")
-                    to_port = rule.get("ToPort")
-
-                    # Step 1: Must be public
-                    if not is_public(rule):
-                        continue
-
-                    # Step 2: Must be ALL PORTS
-                    if not is_all_ports(rule):
-                        continue
-
-                    # Step 3: Record finding immediately
                     findings += 1
+
+                    rule = bad_sgs[sg_id]
 
                     results.append({
                         "Region": region,
                         "InstanceId": instance_id,
                         "InstanceArn": arn,
                         "SecurityGroupId": sg_id,
-                        "RuleProtocol": proto,
-                        "FromPort": from_port,
-                        "ToPort": to_port,
+                        "RuleProtocol": rule["Protocol"],
+                        "FromPort": rule["FromPort"],
+                        "ToPort": rule["ToPort"],
                         "Status": "NON_COMPLIANT",
-                        "Reason": "Public access to ALL ports"
+                        "Reason": "SG allows ALL ports from internet"
                     })
 
     return results, total_instances, findings
@@ -192,7 +177,7 @@ def check_all_ports(session):
 
 def write_csv(account_id, results):
 
-    filename = f"ec2_all_ports_correct_{account_id}.csv"
+    filename = f"ec2_all_ports_FINAL_{account_id}.csv"
 
     with open(filename, "w", newline="") as f:
 
@@ -227,10 +212,10 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Check EC2 ALL ports exposure correctly"
+        description="FINAL EC2 ALL PORTS EXPOSURE CHECK (Correct)"
     )
 
-    parser.add_argument("-R", "--role-arn", help="Role ARN")
+    parser.add_argument("-R", "--role-arn")
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
@@ -239,12 +224,12 @@ def main():
     results, total_instances, findings = check_all_ports(session)
 
     print("\n====================================================")
-    print("CONTROL: EC2 ALL PORTS EXPOSURE")
+    print("CONTROL: EC2 ALL PORTS EXPOSURE (FINAL)")
     print(f"ACCOUNT: {account_id}")
     print("====================================================\n")
 
     print(f"Total Instances Checked : {total_instances}")
-    print(f"Findings (Non-Compliant): {findings}")
+    print(f"Findings                : {findings}")
 
     overall = "COMPLIANT" if findings == 0 else "NON_COMPLIANT"
 
