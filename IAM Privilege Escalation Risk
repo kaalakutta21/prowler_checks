@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+import json
+from tqdm import tqdm
+
+# ==================================================
+# RISKY ACTIONS
+# ==================================================
+
+PRIV_ESC_ACTIONS = [
+    "iam:passrole",
+    "iam:attachrolepolicy",
+    "iam:putrolepolicy",
+    "iam:createpolicyversion",
+    "iam:setdefaultpolicyversion",
+    "iam:addusertogroup",
+    "iam:updateassumerolepolicy",
+    "iam:createaccesskey",
+    "iam:putuserpolicy",
+    "iam:attachuserpolicy",
+    "sts:assumerole",
+    "iam:*",
+    "*"
+]
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        sts = boto3.client("sts")
+        creds = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="iam-priv-esc"
+        )["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# HELPERS
+# ==================================================
+
+def normalize_to_list(value):
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def is_risky_action(actions):
+
+    actions = [a.lower() for a in actions]
+
+    for action in actions:
+        for risky in PRIV_ESC_ACTIONS:
+            if risky == "*" or risky.endswith("*"):
+                if action.startswith(risky.replace("*", "")):
+                    return True
+            if action == risky:
+                return True
+
+    return False
+
+
+def is_resource_wide(resources):
+
+    resources = normalize_to_list(resources)
+
+    for r in resources:
+        if r == "*" or r.endswith(":*"):
+            return True
+
+    return False
+
+
+# ==================================================
+# MAIN LOGIC
+# ==================================================
+
+def check_policies(session):
+
+    iam = session.client("iam")
+    account_id = get_account_id(session)
+
+    results = []
+    total = 0
+    non_compliant = 0
+
+    paginator = iam.get_paginator("list_policies")
+
+    for page in tqdm(paginator.paginate(Scope="Local"), desc="Scanning Policies"):
+
+        for policy in page["Policies"]:
+
+            total += 1
+
+            policy_arn = policy["Arn"]
+            policy_name = policy["PolicyName"]
+
+            status = "COMPLIANT"
+            evidence = "No privilege escalation risk"
+
+            # Get default version
+            version_id = policy["DefaultVersionId"]
+
+            version = iam.get_policy_version(
+                PolicyArn=policy_arn,
+                VersionId=version_id
+            )
+
+            doc = version["PolicyVersion"]["Document"]
+
+            statements = doc.get("Statement", [])
+
+            if not isinstance(statements, list):
+                statements = [statements]
+
+            for stmt in statements:
+
+                if stmt.get("Effect") != "Allow":
+                    continue
+
+                actions = normalize_to_list(stmt.get("Action", []))
+                resources = stmt.get("Resource", "*")
+
+                if is_risky_action(actions) and is_resource_wide(resources):
+
+                    status = "NON_COMPLIANT"
+                    non_compliant += 1
+
+                    evidence = f"Risky actions: {actions}"
+
+                    break
+
+            results.append({
+                "PolicyName": policy_name,
+                "PolicyArn": policy_arn,
+                "Status": status,
+                "Evidence": evidence
+            })
+
+    return results, total, non_compliant
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"iam_privilege_escalation_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        writer = csv.DictWriter(f, fieldnames=[
+            "Account",
+            "PolicyName",
+            "PolicyArn",
+            "Status",
+            "Evidence"
+        ])
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Check IAM policies for privilege escalation risk"
+    )
+
+    parser.add_argument("-R", "--role-arn")
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total, non_compliant = check_policies(session)
+
+    compliant = total - non_compliant
+
+    print("\n====================================================")
+    print("CONTROL: IAM Privilege Escalation Risk")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Policies       : {total}")
+    print(f"Compliant            : {compliant}")
+    print(f"Non-Compliant        : {non_compliant}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
