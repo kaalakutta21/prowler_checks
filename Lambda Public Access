@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+import json
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        sts = boto3.client("sts")
+        creds = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="lambda-public-check"
+        )["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+    ec2 = session.client("ec2", region_name="us-east-1")
+    return [
+        r["RegionName"]
+        for r in ec2.describe_regions(AllRegions=True)["Regions"]
+        if r["OptInStatus"] in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# HELPERS
+# ==================================================
+
+def normalize(value):
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def is_public_statement(stmt):
+
+    if stmt.get("Effect") != "Allow":
+        return False
+
+    principal = stmt.get("Principal")
+
+    # Normalize principal
+    if isinstance(principal, dict):
+        principal_values = []
+        for v in principal.values():
+            principal_values.extend(normalize(v))
+    else:
+        principal_values = normalize(principal)
+
+    if "*" not in principal_values:
+        return False
+
+    actions = normalize(stmt.get("Action", []))
+    actions = [a.lower() for a in actions]
+
+    if not any("lambda:invokefunction" in a or a == "*" for a in actions):
+        return False
+
+    # 🔥 Check condition (critical)
+    condition = stmt.get("Condition")
+
+    if condition:
+        # If any condition exists, treat as restricted
+        return False
+
+    return True
+
+
+# ==================================================
+# MAIN LOGIC
+# ==================================================
+
+def check_lambda_public(session):
+
+    regions = get_regions(session)
+    account_id = get_account_id(session)
+
+    results = []
+    total = 0
+    non_compliant = 0
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        lambda_client = session.client("lambda", region_name=region)
+
+        paginator = lambda_client.get_paginator("list_functions")
+
+        for page in paginator.paginate():
+
+            for fn in page.get("Functions", []):
+
+                total += 1
+
+                fn_name = fn["FunctionName"]
+                arn = fn["FunctionArn"]
+
+                status = "COMPLIANT"
+                evidence = "No public access"
+
+                try:
+                    policy_resp = lambda_client.get_policy(
+                        FunctionName=fn_name
+                    )
+
+                    policy = json.loads(policy_resp["Policy"])
+                    statements = policy.get("Statement", [])
+
+                    if not isinstance(statements, list):
+                        statements = [statements]
+
+                    for stmt in statements:
+
+                        if is_public_statement(stmt):
+
+                            status = "NON_COMPLIANT"
+                            non_compliant += 1
+
+                            evidence = f"Public access via Principal '*'"
+
+                            break
+
+                except ClientError as e:
+
+                    code = e.response["Error"]["Code"]
+
+                    if code == "ResourceNotFoundException":
+                        # No policy attached → compliant
+                        pass
+                    else:
+                        status = "SKIPPED"
+                        evidence = code
+
+                results.append({
+                    "Region": region,
+                    "FunctionName": fn_name,
+                    "FunctionArn": arn,
+                    "Status": status,
+                    "Evidence": evidence
+                })
+
+    return results, total, non_compliant
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"lambda_public_access_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        writer = csv.DictWriter(f, fieldnames=[
+            "Account",
+            "Region",
+            "FunctionName",
+            "FunctionArn",
+            "Status",
+            "Evidence"
+        ])
+
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Check Lambda public access (resource policy)"
+    )
+
+    parser.add_argument("-R", "--role-arn")
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total, non_compliant = check_lambda_public(session)
+
+    compliant = total - non_compliant
+
+    print("\n====================================================")
+    print("CONTROL: Lambda Public Access")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Functions       : {total}")
+    print(f"Compliant             : {compliant}")
+    print(f"Non-Compliant         : {non_compliant}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
