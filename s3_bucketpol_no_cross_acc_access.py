@@ -32,6 +32,39 @@ def get_account_id(session):
     return session.client("sts").get_caller_identity()["Account"]
 
 # ==================================================
+# HELPERS
+# ==================================================
+
+def normalize(v):
+    if isinstance(v, list):
+        return v
+    return [v]
+
+def extract_account_id(arn):
+    try:
+        return arn.split(":")[4]
+    except:
+        return None
+
+def is_condition_restrictive(condition, current_account):
+    if not condition:
+        return False
+
+    cond_str = json.dumps(condition)
+
+    # Strong restrictions
+    if current_account in cond_str:
+        return True
+
+    if "aws:sourceaccount" in cond_str.lower():
+        return True
+
+    if "aws:sourcearn" in cond_str.lower():
+        return True
+
+    return False
+
+# ==================================================
 # CROSS ACCOUNT DETECTION
 # ==================================================
 
@@ -44,27 +77,41 @@ def is_cross_account(statement, current_account):
     if not principal:
         return False
 
-    # Ignore public (handled in other control)
-    if principal == "*":
+    condition = statement.get("Condition")
+
+    # ✔ Skip restricted statements
+    if is_condition_restrictive(condition, current_account):
         return False
 
-    aws_principals = []
+    # Normalize principals
+    principals = []
+
+    if principal == "*":
+        return True
 
     if isinstance(principal, dict):
-        aws_field = principal.get("AWS")
-        if isinstance(aws_field, str):
-            aws_principals.append(aws_field)
-        elif isinstance(aws_field, list):
-            aws_principals.extend(aws_field)
 
-    for arn in aws_principals:
-        if arn == "*":
-            continue
+        for key in ["AWS", "Service"]:
+            val = principal.get(key)
+            if val:
+                principals.extend(normalize(val))
 
-        if ":iam::" in arn:
-            account_id = arn.split(":")[4]
-            if account_id != current_account:
+    else:
+        principals.extend(normalize(principal))
+
+    for p in principals:
+
+        if p == "*":
+            return True
+
+        if isinstance(p, str) and p.startswith("arn:aws"):
+            acc_id = extract_account_id(p)
+            if acc_id and acc_id != current_account:
                 return True
+
+        # Service principals → treat as potential external access
+        if ".amazonaws.com" in str(p):
+            return True
 
     return False
 
@@ -90,24 +137,28 @@ def check_s3_cross_account(session):
         bucket_name = bucket["Name"]
         total_checked += 1
         cross_account_found = False
+        evidence = "No cross-account access"
 
         try:
             policy = s3.get_bucket_policy(Bucket=bucket_name)
             policy_doc = json.loads(policy["Policy"])
-        except ClientError as e:
-            # No policy means compliant
+        except ClientError:
             results.append({
                 "BucketName": bucket_name,
                 "CrossAccountAccess": False,
-                "Status": "COMPLIANT"
+                "Status": "COMPLIANT",
+                "Evidence": "No bucket policy"
             })
             continue
 
         statements = policy_doc.get("Statement", [])
+        if not isinstance(statements, list):
+            statements = [statements]
 
         for statement in statements:
             if is_cross_account(statement, account_id):
                 cross_account_found = True
+                evidence = f"Statement allows cross-account access: {statement}"
                 break
 
         if cross_account_found:
@@ -119,7 +170,8 @@ def check_s3_cross_account(session):
         results.append({
             "BucketName": bucket_name,
             "CrossAccountAccess": cross_account_found,
-            "Status": status
+            "Status": status,
+            "Evidence": evidence
         })
 
     compliant = total_checked - non_compliant
@@ -131,14 +183,15 @@ def check_s3_cross_account(session):
 # ==================================================
 
 def write_csv(account_id, results):
-    filename = f"s3_cross_account_policy_{account_id}.csv"
+    filename = f"s3_cross_account_policy_fixed_{account_id}.csv"
 
     with open(filename, "w", newline="") as f:
         fields = [
             "Account",
             "BucketName",
             "CrossAccountAccess",
-            "Status"
+            "Status",
+            "Evidence"
         ]
 
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -158,9 +211,9 @@ def write_csv(account_id, results):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Ensure S3 bucket policy does not allow cross-account access"
+        description="Ensure S3 bucket policy does not allow cross-account access (FIXED)"
     )
-    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+    parser.add_argument("-R", "--role-arn")
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
@@ -170,7 +223,7 @@ def main():
         check_s3_cross_account(session)
 
     print("\n====================================================")
-    print("CONTROL: S3 Bucket Policy Does Not Allow Cross Account Access")
+    print("CONTROL: S3 Cross Account Access (FIXED)")
     print(f"ACCOUNT: {account_id}")
     print("====================================================")
 
