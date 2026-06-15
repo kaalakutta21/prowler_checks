@@ -55,23 +55,25 @@ def get_regions(session):
 # HELPERS
 # ==================================================
 
-def get_peering_cidrs(pcx):
-    """
-    Collect requester/accepter IPv4 and IPv6 CIDRs from the peering object.
-    """
+def get_route_table_name(route_table):
+    for tag in route_table.get("Tags", []):
+        if tag.get("Key") == "Name":
+            return tag.get("Value", "")
+    return ""
 
+
+def get_peering_cidrs(pcx):
     cidrs = set()
 
     requester_info = pcx.get("RequesterVpcInfo", {})
     accepter_info = pcx.get("AccepterVpcInfo", {})
 
-    # IPv4
     if requester_info.get("CidrBlock"):
         cidrs.add(requester_info["CidrBlock"])
+
     if accepter_info.get("CidrBlock"):
         cidrs.add(accepter_info["CidrBlock"])
 
-    # IPv6
     for assoc in requester_info.get("Ipv6CidrBlockAssociationSet", []):
         if assoc.get("Ipv6CidrBlock"):
             cidrs.add(assoc["Ipv6CidrBlock"])
@@ -83,14 +85,7 @@ def get_peering_cidrs(pcx):
     return cidrs
 
 
-def check_route_against_peering(route, peering_cidrs):
-    """
-    Flag if route to pcx uses:
-    - 0.0.0.0/0
-    - ::/0
-    - full requester/accepter VPC CIDR
-    """
-
+def evaluate_route(route, peering_cidrs):
     destination = route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock")
 
     if not destination:
@@ -105,13 +100,6 @@ def check_route_against_peering(route, peering_cidrs):
     return False, f"Specific route {destination} only"
 
 
-def get_route_table_name(rt):
-    for tag in rt.get("Tags", []):
-        if tag.get("Key") == "Name":
-            return tag.get("Value", "")
-    return ""
-
-
 # ==================================================
 # CONTROL LOGIC
 # ==================================================
@@ -121,10 +109,11 @@ def check_vpc_peering_routes(session):
     regions = get_regions(session)
 
     results = []
-    total_checked = 0
-    compliant = 0
-    non_compliant = 0
     skipped = 0
+
+    total_peerings = 0
+    compliant_peerings = 0
+    non_compliant_peerings = 0
 
     print(f"\nRegions to Scan: {len(regions)}\n")
 
@@ -137,87 +126,91 @@ def check_vpc_peering_routes(session):
             continue
 
         try:
-            pcx_resp = ec2.describe_vpc_peering_connections()
-            peerings = pcx_resp.get("VpcPeeringConnections", [])
+            peerings = ec2.describe_vpc_peering_connections().get("VpcPeeringConnections", [])
         except ClientError:
             skipped += 1
             continue
 
-        # Build peering lookup
-        peering_map = {}
-        for pcx in peerings:
-            pcx_id = pcx["VpcPeeringConnectionId"]
-            peering_map[pcx_id] = {
-                "Cidrs": get_peering_cidrs(pcx),
-                "Status": pcx.get("Status", {}).get("Code", ""),
-                "RequesterVpcId": pcx.get("RequesterVpcInfo", {}).get("VpcId", ""),
-                "AccepterVpcId": pcx.get("AccepterVpcInfo", {}).get("VpcId", "")
-            }
+        if not peerings:
+            continue
 
         try:
+            route_tables = []
             paginator = ec2.get_paginator("describe_route_tables")
-
             for page in paginator.paginate():
-
-                for rt in page.get("RouteTables", []):
-
-                    route_table_id = rt["RouteTableId"]
-                    route_table_name = get_route_table_name(rt)
-                    vpc_id = rt.get("VpcId", "")
-
-                    for route in rt.get("Routes", []):
-
-                        pcx_id = route.get("VpcPeeringConnectionId")
-                        if not pcx_id:
-                            continue
-
-                        total_checked += 1
-
-                        if pcx_id not in peering_map:
-                            status = "SKIPPED"
-                            evidence = f"Peering connection {pcx_id} not found"
-                            skipped += 1
-
-                            results.append({
-                                "Region": region,
-                                "RouteTableId": route_table_id,
-                                "RouteTableName": route_table_name,
-                                "VpcId": vpc_id,
-                                "VpcPeeringConnectionId": pcx_id,
-                                "Destination": route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", ""),
-                                "Status": status,
-                                "Evidence": evidence
-                            })
-                            continue
-
-                        peering_info = peering_map[pcx_id]
-                        peering_cidrs = peering_info["Cidrs"]
-
-                        is_bad, evidence = check_route_against_peering(route, peering_cidrs)
-
-                        if is_bad:
-                            status = "NON_COMPLIANT"
-                            non_compliant += 1
-                        else:
-                            status = "COMPLIANT"
-                            compliant += 1
-
-                        results.append({
-                            "Region": region,
-                            "RouteTableId": route_table_id,
-                            "RouteTableName": route_table_name,
-                            "VpcId": vpc_id,
-                            "VpcPeeringConnectionId": pcx_id,
-                            "Destination": route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", ""),
-                            "Status": status,
-                            "Evidence": evidence
-                        })
-
+                route_tables.extend(page.get("RouteTables", []))
         except ClientError:
             skipped += 1
             continue
 
-    return results, total_checked, compliant, non_compliant, skipped
+        for pcx in peerings:
+
+            pcx_id = pcx["VpcPeeringConnectionId"]
+            pcx_status = pcx.get("Status", {}).get("Code", "")
+            peering_cidrs = get_peering_cidrs(pcx)
+
+            total_peerings += 1
+            peering_non_compliant = False
+            peering_has_route = False
+
+            for rt in route_tables:
+
+                route_table_id = rt["RouteTableId"]
+                route_table_name = get_route_table_name(rt)
+                vpc_id = rt.get("VpcId", "")
+
+                for route in rt.get("Routes", []):
+
+                    if route.get("VpcPeeringConnectionId") != pcx_id:
+                        continue
+
+                    peering_has_route = True
+
+                    destination = route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", "")
+                    is_bad, evidence = evaluate_route(route, peering_cidrs)
+
+                    status = "NON_COMPLIANT" if is_bad else "COMPLIANT"
+
+                    if is_bad:
+                        peering_non_compliant = True
+
+                    results.append({
+                        "Region": region,
+                        "VpcPeeringConnectionId": pcx_id,
+                        "VpcPeeringStatus": pcx_status,
+                        "RouteTableId": route_table_id,
+                        "RouteTableName": route_table_name,
+                        "VpcId": vpc_id,
+                        "Destination": destination,
+                        "Status": status,
+                        "Evidence": evidence
+                    })
+
+            if peering_non_compliant:
+                non_compliant_peerings += 1
+            else:
+                compliant_peerings += 1
+
+            if not peering_has_route:
+                results.append({
+                    "Region": region,
+                    "VpcPeeringConnectionId": pcx_id,
+                    "VpcPeeringStatus": pcx_status,
+                    "RouteTableId": "",
+                    "RouteTableName": "",
+                    "VpcId": "",
+                    "Destination": "",
+                    "Status": "COMPLIANT",
+                    "Evidence": "No route tables reference this peering connection"
+                })
+
+    return (
+        results,
+        total_peerings,
+        compliant_peerings,
+        non_compliant_peerings,
+        skipped
+    )
 
 
 # ==================================================
@@ -233,10 +226,11 @@ def write_csv(account_id, results):
         fields = [
             "Account",
             "Region",
+            "VpcPeeringConnectionId",
+            "VpcPeeringStatus",
             "RouteTableId",
             "RouteTableName",
             "VpcId",
-            "VpcPeeringConnectionId",
             "Destination",
             "Status",
             "Evidence"
@@ -264,18 +258,13 @@ def main():
         description="VPC peering connection route tables do not include 0.0.0.0/0 or full requester/accepter VPC CIDR routes"
     )
 
-    parser.add_argument(
-        "-R",
-        "--role-arn",
-        help="Role ARN"
-    )
-
+    parser.add_argument("-R", "--role-arn", help="Role ARN")
     args = parser.parse_args()
 
     session = get_session(args.role_arn)
     account_id = get_account_id(session)
 
-    results, total_checked, compliant, non_compliant, skipped = \
+    results, total_peerings, compliant_peerings, non_compliant_peerings, skipped = \
         check_vpc_peering_routes(session)
 
     print("\n====================================================")
@@ -283,18 +272,17 @@ def main():
     print(f"ACCOUNT: {account_id}")
     print("====================================================\n")
 
-    print(f"Total Peering Routes Checked : {total_checked}")
-    print(f"Compliant                    : {compliant}")
-    print(f"Non-Compliant                : {non_compliant}")
-    print(f"Skipped                      : {skipped}")
+    print(f"Total VPC Peering Connections Checked : {total_peerings}")
+    print(f"Compliant                             : {compliant_peerings}")
+    print(f"Non-Compliant                         : {non_compliant_peerings}")
+    print(f"Skipped                               : {skipped}")
 
-    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+    overall = "COMPLIANT" if non_compliant_peerings == 0 else "NON_COMPLIANT"
 
     print(f"\nOVERALL STATUS: {overall}")
     print("====================================================\n")
 
     csv_file = write_csv(account_id, results)
-
     print(f"CSV Report Generated: {csv_file}\n")
 
 
