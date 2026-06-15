@@ -33,25 +33,55 @@ def get_account_id(session):
     return session.client("sts").get_caller_identity()["Account"]
 
 
-def has_confused_deputy_protection(policy_document):
+def normalize_to_list(value):
+    if isinstance(value, list):
+        return value
+    return [value]
 
-    statements = policy_document.get("Statement", [])
+
+def is_service_role(trust_policy):
+    """
+    A role is treated as a service role if any trust policy statement
+    has Principal.Service set.
+    """
+
+    statements = trust_policy.get("Statement", [])
 
     if not isinstance(statements, list):
         statements = [statements]
 
     for statement in statements:
-        condition = statement.get("Condition", {})
+        if statement.get("Effect") != "Allow":
+            continue
 
-        condition_text = json.dumps(condition)
+        principal = statement.get("Principal", {})
+        if not isinstance(principal, dict):
+            continue
 
-        if (
-            "aws:SourceAccount" in condition_text
-            or "aws:SourceArn" in condition_text
-        ):
-            return True
+        service = principal.get("Service")
+        if not service:
+            continue
+
+        services = normalize_to_list(service)
+
+        for svc in services:
+            if isinstance(svc, str) and svc.endswith(".amazonaws.com"):
+                return True
 
     return False
+
+
+def has_confused_deputy_protection(policy_document):
+    """
+    Check recursively and case-insensitively for aws:SourceAccount or aws:SourceArn.
+    """
+
+    policy_text = json.dumps(policy_document).lower()
+
+    return (
+        "aws:sourceaccount" in policy_text
+        or "aws:sourcearn" in policy_text
+    )
 
 
 def check_service_roles(session, account_id):
@@ -70,42 +100,35 @@ def check_service_roles(session, account_id):
     print("\nScanning IAM Service Roles...\n")
 
     try:
-
         for page in paginator.paginate():
 
             for role in tqdm(page.get("Roles", []), leave=False):
 
                 role_name = role["RoleName"]
                 role_arn = role["Arn"]
-                role_path = role.get("Path", "/")
 
-                if "/aws-service-role/" not in role_path:
+                trust_policy = role.get("AssumeRolePolicyDocument", {})
+
+                # FIX: detect service roles from trust policy, not path
+                if not is_service_role(trust_policy):
                     continue
 
                 total += 1
 
                 try:
-
-                    trust_policy = role.get(
-                        "AssumeRolePolicyDocument", {}
-                    )
-
                     if has_confused_deputy_protection(trust_policy):
 
                         status = "COMPLIANT"
                         evidence = (
                             "Contains aws:SourceAccount or aws:SourceArn"
                         )
-
                         compliant += 1
 
                     else:
-
                         status = "NON_COMPLIANT"
                         evidence = (
                             "Missing confused deputy protection condition"
                         )
-
                         non_compliant += 1
 
                     results.append({
