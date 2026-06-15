@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+
+import boto3
+import argparse
+import csv
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+
+# ==================================================
+# AUTH
+# ==================================================
+
+def get_session(role_arn=None):
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="elasticache-public-subnet-audit"
+        )
+        creds = assumed["Credentials"]
+
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+
+def get_regions(session):
+    ec2 = session.client("ec2", region_name="us-east-1")
+
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+
+    return [
+        r["RegionName"]
+        for r in regions
+        if r.get("OptInStatus") in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# HELPERS
+# ==================================================
+
+def get_route_table_for_subnet(ec2, subnet_id, vpc_id):
+    """
+    Return the route table associated with the subnet.
+    If no explicit association exists, return the VPC main route table.
+    """
+    resp = ec2.describe_route_tables(
+        Filters=[
+            {"Name": "association.subnet-id", "Values": [subnet_id]}
+        ]
+    )
+
+    route_tables = resp.get("RouteTables", [])
+    if route_tables:
+        return route_tables[0]
+
+    # Fallback to main route table for the VPC
+    resp = ec2.describe_route_tables(
+        Filters=[
+            {"Name": "vpc-id", "Values": [vpc_id]}
+        ]
+    )
+
+    for rt in resp.get("RouteTables", []):
+        for assoc in rt.get("Associations", []):
+            if assoc.get("Main") is True:
+                return rt
+
+    return None
+
+
+def route_table_has_igw_default(route_table):
+    """
+    Public subnet logic:
+    default route to Internet Gateway (or egress-only IGW for IPv6)
+    means public exposure path exists.
+    NAT is NOT public for this control.
+    """
+    if not route_table:
+        return False, "No route table found"
+
+    for route in route_table.get("Routes", []):
+        destination = route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock")
+
+        if destination not in ["0.0.0.0/0", "::/0"]:
+            continue
+
+        gateway_id = route.get("GatewayId", "")
+        eigw_id = route.get("EgressOnlyInternetGatewayId", "")
+
+        # Internet Gateway -> public
+        if gateway_id.startswith("igw-"):
+            return True, f"Default route to IGW {gateway_id}"
+
+        # Egress-only IGW is not inbound-public, but for this control on public subnets
+        # we do not treat NAT/private outbound as public.
+        # Egress-only IGW is outbound-only IPv6, so not public in the classic sense.
+        if eigw_id.startswith("eigw-"):
+            return False, f"Default IPv6 route to Egress-Only IGW {eigw_id}"
+
+        # NAT Gateway / NAT instance / Transit Gateway / VGW / etc. are not public here
+        nat_gw_id = route.get("NatGatewayId", "")
+        instance_id = route.get("InstanceId", "")
+        transit_gw_id = route.get("TransitGatewayId", "")
+
+        if nat_gw_id.startswith("nat-"):
+            return False, f"Default route to NAT Gateway {nat_gw_id}"
+
+        if instance_id.startswith("i-"):
+            return False, f"Default route to NAT/instance {instance_id}"
+
+        if transit_gw_id.startswith("tgw-"):
+            return False, f"Default route to Transit Gateway {transit_gw_id}"
+
+    return False, "No IGW default route"
+
+
+# ==================================================
+# CONTROL LOGIC
+# ==================================================
+
+def check_elasticache_public_subnets(session):
+
+    regions = get_regions(session)
+
+    results = []
+    total_checked = 0
+    non_compliant = 0
+    skipped = 0
+
+    account_id = get_account_id(session)
+
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+
+        try:
+            ec = session.client("elasticache", region_name=region)
+            ec2 = session.client("ec2", region_name=region)
+
+            paginator = ec.get_paginator("describe_cache_clusters")
+
+        except ClientError:
+            skipped += 1
+            continue
+
+        try:
+            for page in paginator.paginate(ShowCacheNodeInfo=False):
+
+                for cluster in page.get("CacheClusters", []):
+
+                    total_checked += 1
+
+                    cluster_id = cluster["CacheClusterId"]
+                    engine = cluster.get("Engine", "")
+                    subnet_group_name = cluster.get("CacheSubnetGroupName", "")
+                    arn = cluster.get(
+                        "ARN",
+                        f"arn:aws:elasticache:{region}:{account_id}:cluster:{cluster_id}"
+                    )
+
+                    status = "COMPLIANT"
+                    evidence_parts = []
+
+                    if not subnet_group_name:
+                        status = "SKIPPED"
+                        evidence = "No subnet group attached"
+                        skipped += 1
+
+                        results.append({
+                            "Region": region,
+                            "ClusterId": cluster_id,
+                            "ClusterArn": arn,
+                            "Engine": engine,
+                            "SubnetGroup": subnet_group_name,
+                            "Status": status,
+                            "Evidence": evidence
+                        })
+                        continue
+
+                    try:
+                        subnet_group_resp = ec.describe_cache_subnet_groups(
+                            CacheSubnetGroupName=subnet_group_name
+                        )
+
+                        subnet_groups = subnet_group_resp.get("CacheSubnetGroups", [])
+                        if not subnet_groups:
+                            status = "SKIPPED"
+                            evidence = "Subnet group not found"
+                            skipped += 1
+
+                            results.append({
+                                "Region": region,
+                                "ClusterId": cluster_id,
+                                "ClusterArn": arn,
+                                "Engine": engine,
+                                "SubnetGroup": subnet_group_name,
+                                "Status": status,
+                                "Evidence": evidence
+                            })
+                            continue
+
+                        subnet_group = subnet_groups[0]
+
+                    except ClientError as e:
+                        status = "SKIPPED"
+                        evidence = f"Unable to describe subnet group: {e.response['Error']['Code']}"
+                        skipped += 1
+
+                        results.append({
+                            "Region": region,
+                            "ClusterId": cluster_id,
+                            "ClusterArn": arn,
+                            "Engine": engine,
+                            "SubnetGroup": subnet_group_name,
+                            "Status": status,
+                            "Evidence": evidence
+                        })
+                        continue
+
+                    subnets = subnet_group.get("Subnets", [])
+
+                    any_public_subnet = False
+
+                    for subnet_entry in subnets:
+                        subnet_id = subnet_entry.get("SubnetIdentifier")
+                        if not subnet_id:
+                            continue
+
+                        try:
+                            subnet_resp = ec2.describe_subnets(SubnetIds=[subnet_id])
+                            subnet = subnet_resp["Subnets"][0]
+                            vpc_id = subnet["VpcId"]
+
+                            route_table = get_route_table_for_subnet(ec2, subnet_id, vpc_id)
+                            is_public, route_evidence = route_table_has_igw_default(route_table)
+
+                            if is_public:
+                                any_public_subnet = True
+                                evidence_parts.append(f"{subnet_id}: {route_evidence}")
+                            else:
+                                evidence_parts.append(f"{subnet_id}: {route_evidence}")
+
+                        except ClientError as e:
+                            evidence_parts.append(f"{subnet_id}: error {e.response['Error']['Code']}")
+
+                    if any_public_subnet:
+                        status = "NON_COMPLIANT"
+                        non_compliant += 1
+                    else:
+                        status = "COMPLIANT"
+
+                    results.append({
+                        "Region": region,
+                        "ClusterId": cluster_id,
+                        "ClusterArn": arn,
+                        "Engine": engine,
+                        "SubnetGroup": subnet_group_name,
+                        "Status": status,
+                        "Evidence": " | ".join(evidence_parts) if evidence_parts else "No subnet data"
+                    })
+
+        except ClientError:
+            skipped += 1
+            continue
+
+    compliant = total_checked - non_compliant
+
+    return results, total_checked, compliant, non_compliant, skipped
+
+
+# ==================================================
+# CSV
+# ==================================================
+
+def write_csv(account_id, results):
+
+    filename = f"elasticache_public_subnets_{account_id}.csv"
+
+    with open(filename, "w", newline="") as f:
+
+        fields = [
+            "Account",
+            "Region",
+            "ClusterId",
+            "ClusterArn",
+            "Engine",
+            "SubnetGroup",
+            "Status",
+            "Evidence"
+        ]
+
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "Account": account_id,
+                **r
+            })
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="ElastiCache cluster is not using public subnets"
+    )
+    parser.add_argument("-R", "--role-arn", help="Role ARN to assume")
+    args = parser.parse_args()
+
+    session = get_session(args.role_arn)
+    account_id = get_account_id(session)
+
+    results, total_checked, compliant, non_compliant, skipped = \
+        check_elasticache_public_subnets(session)
+
+    print("\n====================================================")
+    print("CONTROL: ElastiCache Cluster Is Not Using Public Subnets")
+    print(f"ACCOUNT: {account_id}")
+    print("====================================================\n")
+
+    print(f"Total Clusters Checked : {total_checked}")
+    print(f"Compliant              : {compliant}")
+    print(f"Non-Compliant          : {non_compliant}")
+    print(f"Skipped                : {skipped}")
+
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print(f"\nOVERALL STATUS: {overall}")
+    print("====================================================\n")
+
+    csv_file = write_csv(account_id, results)
+
+    print(f"CSV Generated: {csv_file}\n")
+
+
+if __name__ == "__main__":
+    main()
