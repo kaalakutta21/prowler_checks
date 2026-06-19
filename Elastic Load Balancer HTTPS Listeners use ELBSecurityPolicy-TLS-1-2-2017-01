@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+Control      : Elastic Load Balancer HTTPS Listeners use ELBSecurityPolicy-TLS-1-2-2017-01
+               (or an equivalent/stricter TLS 1.2+ predefined policy)
+Scope        : ALB / NLB (ELBv2 - HTTPS listeners) + Classic ELB (HTTPS/SSL listeners)
+Author       : Cloud Security / Compliance Automation
+"""
+
+import argparse
+import csv
+from datetime import datetime, timezone
+
+import boto3
+from tqdm import tqdm
+from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
+
+CONTROL_NAME = "ELB HTTPS Listeners - ELBSecurityPolicy-TLS-1-2-2017-01 (or stricter)"
+
+# Policies that enforce a minimum of TLS 1.2 (equal or stricter than the baseline policy).
+# Anything NOT in this set (e.g. 2016-08, TLS-1-0-*, TLS-1-1-*, 2015-05) permits TLS < 1.2.
+ACCEPTABLE_TLS_POLICIES = {
+    "ELBSecurityPolicy-TLS-1-2-2017-01",      # baseline required policy
+    "ELBSecurityPolicy-TLS-1-2-Ext-2018-06",
+    "ELBSecurityPolicy-FS-2018-06",
+    "ELBSecurityPolicy-FS-1-1-2019-08",
+    "ELBSecurityPolicy-FS-1-2-2019-08",
+    "ELBSecurityPolicy-FS-1-2-Res-2019-08",
+    "ELBSecurityPolicy-FS-1-2-Res-2020-10",
+    "ELBSecurityPolicy-TLS13-1-2-2021-06",
+    "ELBSecurityPolicy-TLS13-1-2-Res-2021-06",
+    "ELBSecurityPolicy-TLS13-1-2-Ext1-2021-06",
+    "ELBSecurityPolicy-TLS13-1-2-Ext2-2021-06",
+    "ELBSecurityPolicy-TLS13-1-3-2021-06",
+}
+
+# ==================================================
+# AUTH
+# ==================================================
+def get_session(role_arn=None):
+    if role_arn:
+        base = boto3.Session()
+        sts = base.client("sts")
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="control-audit"
+        )
+        creds = assumed["Credentials"]
+        return boto3.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"]
+        )
+    return boto3.Session()
+
+
+def get_account_id(session):
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+# ==================================================
+# REGIONS
+# ==================================================
+def get_regions(session):
+    ec2 = session.client("ec2", region_name="us-east-1")
+    regions = ec2.describe_regions(AllRegions=True)["Regions"]
+    return [
+        r["RegionName"]
+        for r in regions
+        if r.get("OptInStatus") in ["opt-in-not-required", "opted-in"]
+    ]
+
+
+# ==================================================
+# HELPERS
+# ==================================================
+def classify_error(e):
+    """Return a short, human-readable reason from a ClientError/other exception."""
+    if isinstance(e, ClientError):
+        code = e.response.get("Error", {}).get("Code", "Unknown")
+        msg = e.response.get("Error", {}).get("Message", str(e))
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation"):
+            return f"AccessDenied: {msg}"
+        if code in ("OptInRequired", "AuthFailure", "UnrecognizedClientException"):
+            return f"AuthIssue: {msg}"
+        if code in ("Throttling", "ThrottlingException", "RequestLimitExceeded"):
+            return f"Throttled: {msg}"
+        return f"{code}: {msg}"
+    if isinstance(e, EndpointConnectionError):
+        return f"RegionUnavailable: {str(e)}"
+    return f"Error: {str(e)}"
+
+
+def evaluate_policy(policy_name):
+    """Returns (status, evidence) for a given SSL/TLS security policy name."""
+    if policy_name in ACCEPTABLE_TLS_POLICIES:
+        if policy_name == "ELBSecurityPolicy-TLS-1-2-2017-01":
+            return "COMPLIANT", f"Uses required policy '{policy_name}'"
+        return "COMPLIANT", f"Uses equivalent/stricter TLS 1.2+ policy '{policy_name}'"
+    return "NON_COMPLIANT", f"Uses '{policy_name}' which permits TLS < 1.2 or is a custom/unknown policy"
+
+
+# ==================================================
+# CONTROL LOGIC - ALB / NLB (ELBv2)
+# ==================================================
+def check_elbv2(client, region, account_id, results, counters):
+    paginator = client.get_paginator("describe_load_balancers")
+    for page in paginator.paginate():
+        for lb in page.get("LoadBalancers", []):
+            lb_arn = lb["LoadBalancerArn"]
+            lb_name = lb["LoadBalancerName"]
+
+            try:
+                listeners = client.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"]
+            except ClientError as e:
+                counters["skipped"] += 1
+                results.append({
+                    "Region": region, "ResourceType": "ALB/NLB", "ResourceId": lb_name,
+                    "ResourceArn": lb_arn, "Status": "SKIPPED", "Evidence": classify_error(e)
+                })
+                continue
+
+            https_listeners = [l for l in listeners if l.get("Protocol") in ("HTTPS", "TLS")]
+
+            if not https_listeners:
+                counters["skipped"] += 1
+                results.append({
+                    "Region": region, "ResourceType": "ALB/NLB", "ResourceId": lb_name,
+                    "ResourceArn": lb_arn, "Status": "SKIPPED",
+                    "Evidence": "No HTTPS/TLS listeners present - control not applicable"
+                })
+                continue
+
+            for listener in https_listeners:
+                counters["total_checked"] += 1
+                port = listener.get("Port", "N/A")
+                policy_name = listener.get("SslPolicy", "NONE")
+                resource_id = f"{lb_name}:{port}"
+                status, evidence = evaluate_policy(policy_name)
+                counters["compliant" if status == "COMPLIANT" else "non_compliant"] += 1
+                results.append({
+                    "Region": region, "ResourceType": "ALB/NLB-Listener", "ResourceId": resource_id,
+                    "ResourceArn": listener.get("ListenerArn", lb_arn), "Status": status, "Evidence": evidence
+                })
+
+
+# ==================================================
+# CONTROL LOGIC - Classic ELB
+# ==================================================
+def check_classic_elb(client, region, account_id, results, counters):
+    paginator = client.get_paginator("describe_load_balancers")
+    for page in paginator.paginate():
+        for lb in page.get("LoadBalancerDescriptions", []):
+            lb_name = lb["LoadBalancerName"]
+            lb_arn = f"arn:aws:elasticloadbalancing:{region}:{account_id}:loadbalancer/{lb_name}"
+
+            https_listeners = [
+                desc for desc in lb.get("ListenerDescriptions", [])
+                if desc.get("Listener", {}).get("Protocol") in ("HTTPS", "SSL")
+            ]
+
+            if not https_listeners:
+                counters["skipped"] += 1
+                results.append({
+                    "Region": region, "ResourceType": "ClassicELB", "ResourceId": lb_name,
+                    "ResourceArn": lb_arn, "Status": "SKIPPED",
+                    "Evidence": "No HTTPS/SSL listeners present - control not applicable"
+                })
+                continue
+
+            try:
+                policy_desc = client.describe_load_balancer_policies(LoadBalancerName=lb_name)
+                policy_map = {p["PolicyName"]: p for p in policy_desc.get("PolicyDescriptions", [])}
+            except ClientError as e:
+                counters["skipped"] += 1
+                results.append({
+                    "Region": region, "ResourceType": "ClassicELB", "ResourceId": lb_name,
+                    "ResourceArn": lb_arn, "Status": "SKIPPED", "Evidence": classify_error(e)
+                })
+                continue
+
+            for desc in https_listeners:
+                listener = desc["Listener"]
+                port = listener.get("LoadBalancerPort", "N/A")
+                policy_names = desc.get("PolicyNames", [])
+                resource_id = f"{lb_name}:{port}"
+                counters["total_checked"] += 1
+
+                if not policy_names:
+                    status, evidence = "NON_COMPLIANT", "No SSL security policy attached to listener"
+                else:
+                    # Classic ELB references a policy name; resolve its reference attributes
+                    # to find a matching predefined policy name if present.
+                    resolved_name = policy_names[0]
+                    status, evidence = evaluate_policy(resolved_name)
+
+                counters["compliant" if status == "COMPLIANT" else "non_compliant"] += 1
+                results.append({
+                    "Region": region, "ResourceType": "ClassicELB-Listener", "ResourceId": resource_id,
+                    "ResourceArn": lb_arn, "Status": status, "Evidence": evidence
+                })
+
+
+# ==================================================
+# CONTROL LOGIC - DRIVER
+# ==================================================
+def check_control(session, account_id, regions):
+    results = []
+    counters = {"total_checked": 0, "compliant": 0, "non_compliant": 0, "skipped": 0}
+
+    for region in tqdm(regions, desc="Scanning Regions"):
+        try:
+            elbv2_client = session.client("elbv2", region_name=region)
+            elb_client = session.client("elb", region_name=region)
+        except (ClientError, EndpointConnectionError) as e:
+            counters["skipped"] += 1
+            results.append({
+                "Region": region, "ResourceType": "N/A", "ResourceId": "N/A",
+                "ResourceArn": "N/A", "Status": "SKIPPED", "Evidence": classify_error(e)
+            })
+            continue
+
+        try:
+            check_elbv2(elbv2_client, region, account_id, results, counters)
+        except ClientError as e:
+            counters["skipped"] += 1
+            results.append({
+                "Region": region, "ResourceType": "ALB/NLB", "ResourceId": "N/A",
+                "ResourceArn": "N/A", "Status": "SKIPPED", "Evidence": classify_error(e)
+            })
+
+        try:
+            check_classic_elb(elb_client, region, account_id, results, counters)
+        except ClientError as e:
+            counters["skipped"] += 1
+            results.append({
+                "Region": region, "ResourceType": "ClassicELB", "ResourceId": "N/A",
+                "ResourceArn": "N/A", "Status": "SKIPPED", "Evidence": classify_error(e)
+            })
+
+    return (results, counters["total_checked"], counters["compliant"],
+            counters["non_compliant"], counters["skipped"])
+
+
+# ==================================================
+# CSV
+# ==================================================
+def write_csv(results, account_id):
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"elb_https_tls_policy_{account_id}_{timestamp}.csv"
+    fieldnames = ["Account", "Region", "ResourceType", "ResourceId", "ResourceArn", "Status", "Evidence"]
+
+    with open(filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow({"Account": account_id, **row})
+
+    return filename
+
+
+# ==================================================
+# MAIN
+# ==================================================
+def main():
+    parser = argparse.ArgumentParser(description=CONTROL_NAME)
+    parser.add_argument("-R", "--role-arn", help="IAM Role ARN to assume", default=None)
+    args = parser.parse_args()
+
+    try:
+        session = get_session(args.role_arn)
+        account_id = get_account_id(session)
+    except (NoCredentialsError, ClientError) as e:
+        print(f"AUTH FAILED: {classify_error(e)}")
+        return
+
+    regions = get_regions(session)
+    print(f"\nRegions to Scan: {len(regions)}\n")
+
+    results, total_checked, compliant, non_compliant, skipped = check_control(
+        session, account_id, regions
+    )
+
+    csv_file = write_csv(results, account_id)
+    overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
+
+    print("\n" + "=" * 60)
+    print(f"CONTROL : {CONTROL_NAME}")
+    print(f"ACCOUNT : {account_id}")
+    print("=" * 60)
+    print(f"Total Checked   : {total_checked}")
+    print(f"Compliant       : {compliant}")
+    print(f"Non-Compliant   : {non_compliant}")
+    print(f"Skipped         : {skipped}")
+    print(f"Overall Status  : {overall}")
+    print("=" * 60)
+    print(f"CSV Report Generated: {csv_file}")
+    print("=" * 60 + "\n")
+
+
+if __name__ == "__main__":
+    main()
