@@ -55,6 +55,10 @@ def get_regions(session):
 # HELPERS
 # ==================================================
 
+def classify_error(e):
+    return e.response["Error"]["Code"]
+
+
 def get_route_table_name(route_table):
     for tag in route_table.get("Tags", []):
         if tag.get("Key") == "Name":
@@ -85,22 +89,12 @@ def get_peering_cidrs(pcx):
     return cidrs
 
 
-def get_peering_side_details(pcx):
-    requester = pcx.get("RequesterVpcInfo", {})
-    accepter = pcx.get("AccepterVpcInfo", {})
-
-    return {
-        "RequesterVpcId": requester.get("VpcId", ""),
-        "RequesterOwnerId": requester.get("OwnerId", ""),
-        "RequesterRegion": requester.get("Region", ""),
-        "AccepterVpcId": accepter.get("VpcId", ""),
-        "AccepterOwnerId": accepter.get("OwnerId", ""),
-        "AccepterRegion": accepter.get("Region", "")
-    }
+def get_destination(route):
+    return route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", "")
 
 
 def evaluate_route(route, peering_cidrs):
-    destination = route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock")
+    destination = get_destination(route)
 
     if not destination:
         return False, "No CIDR destination"
@@ -109,7 +103,7 @@ def evaluate_route(route, peering_cidrs):
         return True, f"Default route {destination} points to peering connection"
 
     if destination in peering_cidrs:
-        return True, f"Full requester/accepter VPC CIDR {destination} points to peering connection"
+        return True, f"Entire requester/accepter VPC CIDR {destination} points to peering connection"
 
     return False, f"Specific route {destination} only"
 
@@ -164,7 +158,7 @@ def check_control(session):
                 region,
                 "N/A",
                 "N/A",
-                f"Client init failed: {e.response['Error']['Code']}"
+                f"Client init failed: {classify_error(e)}"
             ))
             continue
 
@@ -177,37 +171,28 @@ def check_control(session):
                 region,
                 "N/A",
                 "N/A",
-                f"describe_vpc_peering_connections failed: {e.response['Error']['Code']}"
+                f"describe_vpc_peering_connections failed: {classify_error(e)}"
             ))
             continue
 
         if not peerings:
             continue
 
-        peering_map = {}
-        for pcx in peerings:
-            pcx_id = pcx["VpcPeeringConnectionId"]
-            peering_map[pcx_id] = {
-                "Cidrs": get_peering_cidrs(pcx),
-                "Status": pcx.get("Status", {}).get("Code", ""),
-                **get_peering_side_details(pcx)
-            }
-
         for pcx in peerings:
 
             pcx_id = pcx["VpcPeeringConnectionId"]
             pcx_arn = f"arn:aws:ec2:{region}:{account_id}:vpc-peering-connection/{pcx_id}"
             pcx_status = pcx.get("Status", {}).get("Code", "")
-            peering_cidrs = peering_map[pcx_id]["Cidrs"]
+            peering_cidrs = get_peering_cidrs(pcx)
 
             total_checked += 1
             peering_non_compliant = False
-            peering_had_route = False
+            peering_has_routes = False
 
             try:
-                route_paginator = ec2.get_paginator("describe_route_tables")
+                paginator = ec2.get_paginator("describe_route_tables")
 
-                for page in route_paginator.paginate(
+                for page in paginator.paginate(
                     Filters=[{
                         "Name": "route.vpc-peering-connection-id",
                         "Values": [pcx_id]
@@ -224,15 +209,10 @@ def check_control(session):
                             if route.get("VpcPeeringConnectionId") != pcx_id:
                                 continue
 
-                            peering_had_route = True
+                            peering_has_routes = True
 
-                            destination = (
-                                route.get("DestinationCidrBlock")
-                                or route.get("DestinationIpv6CidrBlock", "")
-                            )
-
+                            destination = get_destination(route)
                             is_bad, evidence = evaluate_route(route, peering_cidrs)
-
                             status = "NON_COMPLIANT" if is_bad else "COMPLIANT"
 
                             if is_bad:
@@ -257,7 +237,7 @@ def check_control(session):
                     region,
                     pcx_id,
                     pcx_arn,
-                    f"describe_route_tables failed: {e.response['Error']['Code']}"
+                    f"describe_route_tables failed: {classify_error(e)}"
                 ))
                 continue
 
@@ -266,7 +246,7 @@ def check_control(session):
             else:
                 compliant += 1
 
-            if not peering_had_route:
+            if not peering_has_routes:
                 results.append({
                     "Region": region,
                     "VpcPeeringConnectionId": pcx_id,
