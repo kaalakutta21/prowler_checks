@@ -66,34 +66,16 @@ def get_route_table_name(route_table):
     return ""
 
 
-def get_peering_cidrs(pcx):
-    cidrs = set()
-
-    requester = pcx.get("RequesterVpcInfo", {})
-    accepter = pcx.get("AccepterVpcInfo", {})
-
-    if requester.get("CidrBlock"):
-        cidrs.add(requester["CidrBlock"])
-
-    if accepter.get("CidrBlock"):
-        cidrs.add(accepter["CidrBlock"])
-
-    for assoc in requester.get("Ipv6CidrBlockAssociationSet", []):
-        if assoc.get("Ipv6CidrBlock"):
-            cidrs.add(assoc["Ipv6CidrBlock"])
-
-    for assoc in accepter.get("Ipv6CidrBlockAssociationSet", []):
-        if assoc.get("Ipv6CidrBlock"):
-            cidrs.add(assoc["Ipv6CidrBlock"])
-
-    return cidrs
-
-
 def get_destination(route):
     return route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", "")
 
 
-def evaluate_route(route, peering_cidrs):
+def evaluate_route(route):
+    """
+    Prowler-like relaxed logic:
+    ONLY flag default routes pointing to the peering connection.
+    Do NOT flag full requester/accepter CIDR routes.
+    """
     destination = get_destination(route)
 
     if not destination:
@@ -102,10 +84,7 @@ def evaluate_route(route, peering_cidrs):
     if destination in ["0.0.0.0/0", "::/0"]:
         return True, f"Default route {destination} points to peering connection"
 
-    if destination in peering_cidrs:
-        return True, f"Entire requester/accepter VPC CIDR {destination} points to peering connection"
-
-    return False, f"Specific route {destination} only"
+    return False, f"Non-default route {destination} points to peering connection"
 
 
 def skipped_row(region, pcx_id, pcx_arn, reason):
@@ -129,8 +108,7 @@ def skipped_row(region, pcx_id, pcx_arn, reason):
 #
 # Control:
 # VPC peering connection route tables do not include
-# 0.0.0.0/0, ::/0, or entire requester/accepter VPC CIDR
-# routes pointing to the peering connection.
+# 0.0.0.0/0 or ::/0 routes pointing to the peering connection.
 #
 # Summary counts are based on VPC peering connections.
 # Detailed CSV rows are route-table / route level.
@@ -183,7 +161,6 @@ def check_control(session):
             pcx_id = pcx["VpcPeeringConnectionId"]
             pcx_arn = f"arn:aws:ec2:{region}:{account_id}:vpc-peering-connection/{pcx_id}"
             pcx_status = pcx.get("Status", {}).get("Code", "")
-            peering_cidrs = get_peering_cidrs(pcx)
 
             total_checked += 1
             peering_non_compliant = False
@@ -212,7 +189,7 @@ def check_control(session):
                             peering_has_routes = True
 
                             destination = get_destination(route)
-                            is_bad, evidence = evaluate_route(route, peering_cidrs)
+                            is_bad, evidence = evaluate_route(route)
                             status = "NON_COMPLIANT" if is_bad else "COMPLIANT"
 
                             if is_bad:
@@ -268,7 +245,7 @@ def check_control(session):
 # ==================================================
 
 def write_csv(account_id, results):
-    filename = f"vpc_peering_route_tables_no_broad_routes_{account_id}.csv"
+    filename = f"vpc_peering_route_tables_no_default_routes_{account_id}.csv"
 
     fields = [
         "Account",
@@ -304,8 +281,7 @@ def write_csv(account_id, results):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "VPC peering connection route tables do not include 0.0.0.0/0, ::/0, "
-            "or entire requester/accepter VPC CIDR routes"
+            "VPC peering connection route tables do not include 0.0.0.0/0 or ::/0 routes"
         )
     )
 
@@ -326,7 +302,7 @@ def main():
     overall = "COMPLIANT" if non_compliant == 0 else "NON_COMPLIANT"
 
     print("\n====================================================")
-    print("CONTROL : VPC Peering Connection Route Tables Do Not Include 0.0.0.0/0 Or Entire Requester/Accepter VPC CIDR Routes")
+    print("CONTROL : VPC Peering Connection Route Tables Do Not Include 0.0.0.0/0 Routes")
     print(f"ACCOUNT : {account_id}")
     print("====================================================")
     print(f"Total Checked  : {total_checked}")
