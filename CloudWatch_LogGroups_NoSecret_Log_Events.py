@@ -106,50 +106,42 @@ def build_detectors():
         {
             "name": "AWS Access Key ID",
             "pattern": re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{16}\b"),
-            "require_context": False
         },
         {
             "name": "JWT Token",
             "pattern": re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}\b"),
-            "require_context": False
         },
         {
             "name": "Private Key",
             "pattern": re.compile(r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
-            "require_context": False
         },
         {
             "name": "Bearer Token",
             "pattern": re.compile(r"(?i)\bbearer\s+([A-Za-z0-9\-._~+/]+=*)"),
-            "require_context": False
         },
         {
             "name": "Password Assignment",
             "pattern": re.compile(
                 r"(?i)\b(password|passwd|pwd)\b\s*[:=]\s*['\"]?([^\s'\";,]{8,})"
             ),
-            "require_context": True
         },
         {
             "name": "API Key Assignment",
             "pattern": re.compile(
                 r"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token)\b\s*[:=]\s*['\"]?([^\s'\";,]{12,})"
             ),
-            "require_context": True
         },
         {
             "name": "AWS Secret Access Key Assignment",
             "pattern": re.compile(
                 r"(?i)\b(aws[_-]?secret[_-]?access[_-]?key)\b\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})"
             ),
-            "require_context": True
         },
         {
             "name": "Credential in URL",
             "pattern": re.compile(
                 r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:([^/\s@]+)@[^/\s]+\b"
             ),
-            "require_context": False
         },
     ]
 
@@ -170,7 +162,6 @@ def detect_secrets_in_message(message, detectors):
             else:
                 secret_value = match.group(0)
 
-            # conservative filters
             if not secret_value:
                 continue
 
@@ -189,21 +180,19 @@ def detect_secrets_in_message(message, detectors):
     return findings
 
 
+def list_log_groups(logs_client):
+    groups = []
+    paginator = logs_client.get_paginator("describe_log_groups")
+    for page in paginator.paginate():
+        groups.extend(page.get("logGroups", []))
+    return groups
+
+
 # ==================================================
 # CONTROL LOGIC
 # ==================================================
-#
-# Control:
-# CloudWatch log groups contain no secret in log events
-#
-# Conservative implementation:
-# - scans recent log events
-# - uses regex + context-based detectors
-# - avoids entropy-only detections to reduce false positives
-# - marks log group NON_COMPLIANT if any secret-like event is found
-# ==================================================
 
-def check_control(session, lookback_days=7, max_streams_per_group=20, max_events_per_stream=200):
+def check_control(session, lookback_days=3, max_streams_per_group=10, max_events_per_stream=50):
     account_id = get_account_id(session)
     regions = get_regions(session)
     detectors = build_detectors()
@@ -221,7 +210,6 @@ def check_control(session, lookback_days=7, max_streams_per_group=20, max_events
     print(f"\nRegions to Scan: {len(regions)}\n")
 
     for region in tqdm(regions, desc="Scanning Regions"):
-
         try:
             logs = session.client("logs", region_name=region)
         except ClientError as e:
@@ -230,120 +218,122 @@ def check_control(session, lookback_days=7, max_streams_per_group=20, max_events
             continue
 
         try:
-            lg_paginator = logs.get_paginator("describe_log_groups")
+            log_groups = list_log_groups(logs)
         except ClientError as e:
             skipped += 1
-            results.append(skipped_row(region, "N/A", f"describe_log_groups paginator failed: {classify_error(e)}"))
+            results.append(skipped_row(region, "N/A", f"describe_log_groups failed: {classify_error(e)}"))
             continue
 
-        try:
-            for lg_page in lg_paginator.paginate():
-                for lg in lg_page.get("logGroups", []):
+        if not log_groups:
+            continue
 
-                    log_group_name = lg["logGroupName"]
-                    lg_arn = lg.get("arn", log_group_arn(region, account_id, log_group_name))
+        for lg in tqdm(log_groups, desc=f"  {region}", leave=False):
+            log_group_name = lg["logGroupName"]
+            lg_arn = lg.get("arn", log_group_arn(region, account_id, log_group_name))
 
-                    total_checked += 1
-                    group_has_secret = False
+            total_checked += 1
+            group_has_secret = False
 
-                    try:
-                        stream_resp = logs.describe_log_streams(
-                            logGroupName=log_group_name,
-                            orderBy="LastEventTime",
-                            descending=True,
-                            limit=max_streams_per_group
-                        )
-                        streams = stream_resp.get("logStreams", [])
-                    except ClientError as e:
-                        skipped += 1
-                        results.append({
-                            "Region": region,
-                            "LogGroupName": log_group_name,
-                            "LogGroupArn": lg_arn,
-                            "LogStreamName": "N/A",
-                            "EventTimestamp": "N/A",
-                            "DetectorType": "N/A",
-                            "MatchedPreview": "N/A",
-                            "SnippetPreview": "N/A",
-                            "Status": "SKIPPED",
-                            "Evidence": f"describe_log_streams failed: {classify_error(e)}"
-                        })
+            try:
+                stream_resp = logs.describe_log_streams(
+                    logGroupName=log_group_name,
+                    orderBy="LastEventTime",
+                    descending=True,
+                    limit=max_streams_per_group
+                )
+                streams = stream_resp.get("logStreams", [])
+            except ClientError as e:
+                skipped += 1
+                results.append({
+                    "Region": region,
+                    "LogGroupName": log_group_name,
+                    "LogGroupArn": lg_arn,
+                    "LogStreamName": "N/A",
+                    "EventTimestamp": "N/A",
+                    "DetectorType": "N/A",
+                    "MatchedPreview": "N/A",
+                    "SnippetPreview": "N/A",
+                    "Status": "SKIPPED",
+                    "Evidence": f"describe_log_streams failed: {classify_error(e)}"
+                })
+                continue
+
+            for stream in streams:
+                if group_has_secret:
+                    break
+
+                stream_name = stream.get("logStreamName", "N/A")
+
+                try:
+                    events_resp = logs.get_log_events(
+                        logGroupName=log_group_name,
+                        logStreamName=stream_name,
+                        startTime=start_ms,
+                        startFromHead=False,
+                        limit=max_events_per_stream
+                    )
+                    events = events_resp.get("events", [])
+                except ClientError as e:
+                    skipped += 1
+                    results.append({
+                        "Region": region,
+                        "LogGroupName": log_group_name,
+                        "LogGroupArn": lg_arn,
+                        "LogStreamName": stream_name,
+                        "EventTimestamp": "N/A",
+                        "DetectorType": "N/A",
+                        "MatchedPreview": "N/A",
+                        "SnippetPreview": "N/A",
+                        "Status": "SKIPPED",
+                        "Evidence": f"get_log_events failed: {classify_error(e)}"
+                    })
+                    continue
+
+                for event in events:
+                    message = event.get("message", "")
+                    event_ts = event.get("timestamp", 0)
+
+                    findings = detect_secrets_in_message(message, detectors)
+                    if not findings:
                         continue
 
-                    for stream in streams:
-                        stream_name = stream.get("logStreamName", "N/A")
+                    # only record first strong finding per group for speed/noise reduction
+                    finding = findings[0]
+                    group_has_secret = True
 
-                        try:
-                            events_resp = logs.get_log_events(
-                                logGroupName=log_group_name,
-                                logStreamName=stream_name,
-                                startTime=start_ms,
-                                startFromHead=False,
-                                limit=max_events_per_stream
-                            )
-                            events = events_resp.get("events", [])
-                        except ClientError as e:
-                            skipped += 1
-                            results.append({
-                                "Region": region,
-                                "LogGroupName": log_group_name,
-                                "LogGroupArn": lg_arn,
-                                "LogStreamName": stream_name,
-                                "EventTimestamp": "N/A",
-                                "DetectorType": "N/A",
-                                "MatchedPreview": "N/A",
-                                "SnippetPreview": "N/A",
-                                "Status": "SKIPPED",
-                                "Evidence": f"get_log_events failed: {classify_error(e)}"
-                            })
-                            continue
+                    masked_match = mask_value(finding["secret_value"])
+                    masked_snippet = clip_text(mask_snippet(message, finding["secret_value"]))
 
-                        for event in events:
-                            message = event.get("message", "")
-                            event_ts = event.get("timestamp", 0)
+                    results.append({
+                        "Region": region,
+                        "LogGroupName": log_group_name,
+                        "LogGroupArn": lg_arn,
+                        "LogStreamName": stream_name,
+                        "EventTimestamp": str(event_ts),
+                        "DetectorType": finding["detector"],
+                        "MatchedPreview": masked_match,
+                        "SnippetPreview": masked_snippet,
+                        "Status": "NON_COMPLIANT",
+                        "Evidence": f"Detected likely secret in log event using detector: {finding['detector']}"
+                    })
+                    break
 
-                            findings = detect_secrets_in_message(message, detectors)
-
-                            for finding in findings:
-                                group_has_secret = True
-
-                                masked_match = mask_value(finding["secret_value"])
-                                masked_snippet = clip_text(mask_snippet(message, finding["secret_value"]))
-
-                                results.append({
-                                    "Region": region,
-                                    "LogGroupName": log_group_name,
-                                    "LogGroupArn": lg_arn,
-                                    "LogStreamName": stream_name,
-                                    "EventTimestamp": str(event_ts),
-                                    "DetectorType": finding["detector"],
-                                    "MatchedPreview": masked_match,
-                                    "SnippetPreview": masked_snippet,
-                                    "Status": "NON_COMPLIANT",
-                                    "Evidence": f"Detected likely secret in log event using detector: {finding['detector']}"
-                                })
-
-                    if group_has_secret:
-                        non_compliant += 1
-                    else:
-                        compliant += 1
-                        results.append({
-                            "Region": region,
-                            "LogGroupName": log_group_name,
-                            "LogGroupArn": lg_arn,
-                            "LogStreamName": "",
-                            "EventTimestamp": "",
-                            "DetectorType": "",
-                            "MatchedPreview": "",
-                            "SnippetPreview": "",
-                            "Status": "COMPLIANT",
-                            "Evidence": f"No likely secrets detected in scanned events from the last {lookback_days} day(s)"
-                        })
-
-        except ClientError as e:
-            skipped += 1
-            results.append(skipped_row(region, "N/A", f"Region scan failed: {classify_error(e)}"))
-            continue
+            if group_has_secret:
+                non_compliant += 1
+            else:
+                compliant += 1
+                results.append({
+                    "Region": region,
+                    "LogGroupName": log_group_name,
+                    "LogGroupArn": lg_arn,
+                    "LogStreamName": "",
+                    "EventTimestamp": "",
+                    "DetectorType": "",
+                    "MatchedPreview": "",
+                    "SnippetPreview": "",
+                    "Status": "COMPLIANT",
+                    "Evidence": f"No likely secrets detected in scanned events from the last {lookback_days} day(s)"
+                })
 
     return results, total_checked, compliant, non_compliant, skipped
 
@@ -392,9 +382,9 @@ def main():
     )
 
     parser.add_argument("-R", "--role-arn", help="IAM Role ARN to assume for the audit")
-    parser.add_argument("--lookback-days", type=int, default=7, help="Days of logs to scan (default: 7)")
-    parser.add_argument("--max-streams-per-group", type=int, default=20, help="Max streams per log group (default: 20)")
-    parser.add_argument("--max-events-per-stream", type=int, default=200, help="Max events per stream (default: 200)")
+    parser.add_argument("--lookback-days", type=int, default=3, help="Days of logs to scan (default: 3)")
+    parser.add_argument("--max-streams-per-group", type=int, default=10, help="Max streams per log group (default: 10)")
+    parser.add_argument("--max-events-per-stream", type=int, default=50, help="Max events per stream (default: 50)")
 
     args = parser.parse_args()
 
