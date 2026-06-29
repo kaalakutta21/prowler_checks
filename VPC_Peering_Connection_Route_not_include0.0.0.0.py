@@ -55,11 +55,19 @@ def get_regions(session):
 # HELPERS
 # ==================================================
 
+def classify_error(e):
+    return e.response["Error"]["Code"]
+
+
 def get_route_table_name(route_table):
     for tag in route_table.get("Tags", []):
         if tag.get("Key") == "Name":
             return tag.get("Value", "")
     return ""
+
+
+def get_destination(route):
+    return route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", "")
 
 
 def get_peering_cidrs(pcx):
@@ -86,7 +94,7 @@ def get_peering_cidrs(pcx):
 
 
 def evaluate_route(route, peering_cidrs):
-    destination = route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock")
+    destination = get_destination(route)
 
     if not destination:
         return False, "No CIDR destination"
@@ -95,17 +103,51 @@ def evaluate_route(route, peering_cidrs):
         return True, f"Default route {destination} points to peering connection"
 
     if destination in peering_cidrs:
-        return True, f"Full VPC CIDR {destination} points to peering connection"
+        return True, f"Full requester/accepter VPC CIDR {destination} points to peering connection"
 
     return False, f"Specific route {destination} only"
+
+
+def skipped_row(region, pcx_id, pcx_arn, reason):
+    return {
+        "Region": region,
+        "VpcPeeringConnectionId": pcx_id,
+        "VpcPeeringConnectionArn": pcx_arn,
+        "VpcPeeringStatus": "N/A",
+        "RouteTableId": "N/A",
+        "RouteTableName": "N/A",
+        "VpcId": "N/A",
+        "Destination": "N/A",
+        "Status": "SKIPPED",
+        "Evidence": reason
+    }
 
 
 # ==================================================
 # CONTROL LOGIC
 # ==================================================
+#
+# Control:
+# VPC peering connection route tables do not include
+# 0.0.0.0/0 or entire requester/accepter VPC CIDR routes
+#
+# Logic:
+# - Only ACTIVE peering connections are checked
+# - Only route tables referencing that pcx are checked
+# - Peering is NON_COMPLIANT if any route to that pcx has:
+#     * 0.0.0.0/0
+#     * ::/0
+#     * full requester VPC CIDR
+#     * full accepter VPC CIDR
+# - Peerings with no referencing routes are not counted
+#
+# Summary counts are by VPC peering connection.
+# CSV rows are route-table / route level.
+# ==================================================
 
 def check_vpc_peering_routes(session):
 
+    account_id = get_account_id(session)
     regions = get_regions(session)
 
     results = []
@@ -121,88 +163,107 @@ def check_vpc_peering_routes(session):
 
         try:
             ec2 = session.client("ec2", region_name=region)
-        except ClientError:
+        except ClientError as e:
             skipped += 1
+            results.append(skipped_row(
+                region,
+                "N/A",
+                "N/A",
+                f"Client init failed: {classify_error(e)}"
+            ))
             continue
 
         try:
             peerings = ec2.describe_vpc_peering_connections().get("VpcPeeringConnections", [])
-        except ClientError:
+        except ClientError as e:
             skipped += 1
+            results.append(skipped_row(
+                region,
+                "N/A",
+                "N/A",
+                f"describe_vpc_peering_connections failed: {classify_error(e)}"
+            ))
             continue
 
         if not peerings:
-            continue
-
-        try:
-            route_tables = []
-            paginator = ec2.get_paginator("describe_route_tables")
-            for page in paginator.paginate():
-                route_tables.extend(page.get("RouteTables", []))
-        except ClientError:
-            skipped += 1
             continue
 
         for pcx in peerings:
 
             pcx_id = pcx["VpcPeeringConnectionId"]
             pcx_status = pcx.get("Status", {}).get("Code", "")
+            pcx_arn = f"arn:aws:ec2:{region}:{account_id}:vpc-peering-connection/{pcx_id}"
+
+            # Only active peerings
+            if pcx_status != "active":
+                continue
+
             peering_cidrs = get_peering_cidrs(pcx)
+            peering_non_compliant = False
+            peering_has_referencing_route = False
+
+            try:
+                paginator = ec2.get_paginator("describe_route_tables")
+
+                for page in paginator.paginate(
+                    Filters=[{
+                        "Name": "route.vpc-peering-connection-id",
+                        "Values": [pcx_id]
+                    }]
+                ):
+                    for rt in page.get("RouteTables", []):
+
+                        route_table_id = rt["RouteTableId"]
+                        route_table_name = get_route_table_name(rt)
+                        vpc_id = rt.get("VpcId", "")
+
+                        for route in rt.get("Routes", []):
+
+                            if route.get("VpcPeeringConnectionId") != pcx_id:
+                                continue
+
+                            peering_has_referencing_route = True
+
+                            destination = get_destination(route)
+                            is_bad, evidence = evaluate_route(route, peering_cidrs)
+                            status = "NON_COMPLIANT" if is_bad else "COMPLIANT"
+
+                            if is_bad:
+                                peering_non_compliant = True
+
+                            results.append({
+                                "Region": region,
+                                "VpcPeeringConnectionId": pcx_id,
+                                "VpcPeeringConnectionArn": pcx_arn,
+                                "VpcPeeringStatus": pcx_status,
+                                "RouteTableId": route_table_id,
+                                "RouteTableName": route_table_name,
+                                "VpcId": vpc_id,
+                                "Destination": destination,
+                                "Status": status,
+                                "Evidence": evidence
+                            })
+
+            except ClientError as e:
+                skipped += 1
+                results.append(skipped_row(
+                    region,
+                    pcx_id,
+                    pcx_arn,
+                    f"describe_route_tables failed: {classify_error(e)}"
+                ))
+                continue
+
+            # Count only active peerings that actually have referencing routes
+            if not peering_has_referencing_route:
+                continue
 
             total_peerings += 1
-            peering_non_compliant = False
-            peering_has_route = False
-
-            for rt in route_tables:
-
-                route_table_id = rt["RouteTableId"]
-                route_table_name = get_route_table_name(rt)
-                vpc_id = rt.get("VpcId", "")
-
-                for route in rt.get("Routes", []):
-
-                    if route.get("VpcPeeringConnectionId") != pcx_id:
-                        continue
-
-                    peering_has_route = True
-
-                    destination = route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", "")
-                    is_bad, evidence = evaluate_route(route, peering_cidrs)
-
-                    status = "NON_COMPLIANT" if is_bad else "COMPLIANT"
-
-                    if is_bad:
-                        peering_non_compliant = True
-
-                    results.append({
-                        "Region": region,
-                        "VpcPeeringConnectionId": pcx_id,
-                        "VpcPeeringStatus": pcx_status,
-                        "RouteTableId": route_table_id,
-                        "RouteTableName": route_table_name,
-                        "VpcId": vpc_id,
-                        "Destination": destination,
-                        "Status": status,
-                        "Evidence": evidence
-                    })
 
             if peering_non_compliant:
                 non_compliant_peerings += 1
             else:
                 compliant_peerings += 1
-
-            if not peering_has_route:
-                results.append({
-                    "Region": region,
-                    "VpcPeeringConnectionId": pcx_id,
-                    "VpcPeeringStatus": pcx_status,
-                    "RouteTableId": "",
-                    "RouteTableName": "",
-                    "VpcId": "",
-                    "Destination": "",
-                    "Status": "COMPLIANT",
-                    "Evidence": "No route tables reference this peering connection"
-                })
 
     return (
         results,
@@ -227,6 +288,7 @@ def write_csv(account_id, results):
             "Account",
             "Region",
             "VpcPeeringConnectionId",
+            "VpcPeeringConnectionArn",
             "VpcPeeringStatus",
             "RouteTableId",
             "RouteTableName",
