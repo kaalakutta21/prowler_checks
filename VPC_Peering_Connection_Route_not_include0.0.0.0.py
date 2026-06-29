@@ -70,64 +70,46 @@ def get_destination(route):
     return route.get("DestinationCidrBlock") or route.get("DestinationIpv6CidrBlock", "")
 
 
-def get_requester_cidrs(pcx):
-    cidrs = set()
-    requester_info = pcx.get("RequesterVpcInfo", {})
-
-    if requester_info.get("CidrBlock"):
-        cidrs.add(requester_info["CidrBlock"])
-
-    for assoc in requester_info.get("Ipv6CidrBlockAssociationSet", []):
-        if assoc.get("Ipv6CidrBlock"):
-            cidrs.add(assoc["Ipv6CidrBlock"])
-
-    return cidrs
+def get_primary_requester_cidr(pcx):
+    return pcx.get("RequesterVpcInfo", {}).get("CidrBlock", "")
 
 
-def get_accepter_cidrs(pcx):
-    cidrs = set()
-    accepter_info = pcx.get("AccepterVpcInfo", {})
-
-    if accepter_info.get("CidrBlock"):
-        cidrs.add(accepter_info["CidrBlock"])
-
-    for assoc in accepter_info.get("Ipv6CidrBlockAssociationSet", []):
-        if assoc.get("Ipv6CidrBlock"):
-            cidrs.add(assoc["Ipv6CidrBlock"])
-
-    return cidrs
+def get_primary_accepter_cidr(pcx):
+    return pcx.get("AccepterVpcInfo", {}).get("CidrBlock", "")
 
 
 def evaluate_route(route, route_table_vpc_id, requester_vpc_id, accepter_vpc_id,
-                   requester_cidrs, accepter_cidrs):
+                   requester_primary_cidr, accepter_primary_cidr):
     """
-    Returns:
-      is_default_bad: bool
-      is_full_peer_cidr_bad: bool
-      side: requester|accepter|unknown
-      evidence: str
+    Prowler-like practical logic:
+    - Default route to peering is always NON_COMPLIANT
+    - Whole peer VPC primary CIDR to peering is NON_COMPLIANT
+    - Evaluation is side-aware:
+        requester route table -> compare against accepter primary CIDR
+        accepter route table  -> compare against requester primary CIDR
+    - Do not compare against every secondary/IPv6 CIDR association
     """
     destination = get_destination(route)
 
     if not destination:
-        return False, False, "unknown", "No CIDR destination"
+        return False, "No CIDR destination"
 
     if destination in ["0.0.0.0/0", "::/0"]:
-        return True, False, "unknown", f"Default route {destination} points to peering connection"
+        return True, f"Default route {destination} points to peering connection"
 
     if route_table_vpc_id == requester_vpc_id:
-        if destination in accepter_cidrs:
-            return False, True, "requester", f"Full accepter VPC CIDR {destination} points to peering connection"
-        return False, False, "requester", f"Specific/non-full accepter-side route {destination} only"
+        if accepter_primary_cidr and destination == accepter_primary_cidr:
+            return True, f"Whole accepter VPC CIDR {destination} points to peering connection"
+        return False, f"Specific/non-whole accepter-side route {destination} only"
 
     if route_table_vpc_id == accepter_vpc_id:
-        if destination in requester_cidrs:
-            return False, True, "accepter", f"Full requester VPC CIDR {destination} points to peering connection"
-        return False, False, "accepter", f"Specific/non-full requester-side route {destination} only"
+        if requester_primary_cidr and destination == requester_primary_cidr:
+            return True, f"Whole requester VPC CIDR {destination} points to peering connection"
+        return False, f"Specific/non-whole requester-side route {destination} only"
 
-    return False, False, "unknown", (
+    return False, (
         f"Route table VPC {route_table_vpc_id} does not match requester/accepter VPC; "
-        f"route {destination} not evaluated as broad"
+        f"route {destination} not evaluated as whole-peer-CIDR"
     )
 
 
@@ -150,16 +132,21 @@ def skipped_row(region, pcx_id, pcx_arn, reason):
 # CONTROL LOGIC
 # ==================================================
 #
+# Control:
+# VPC peering connection route tables do not include
+# 0.0.0.0/0 or whole requester/accepter VPC CIDR routes
+#
 # Logic:
 # - Only ACTIVE peering connections are checked
 # - Each pcx is processed once globally
 # - Only route tables referencing that pcx are checked
-# - Default routes to pcx are NON_COMPLIANT immediately
-# - Full peer CIDR routes are tracked by side:
-#     requester-side full accepter CIDR
-#     accepter-side full requester CIDR
-# - Peering is NON_COMPLIANT for full-CIDR logic only if both sides are broad
+# - Default routes to pcx are NON_COMPLIANT
+# - Whole peer primary VPC CIDR routes are NON_COMPLIANT
+# - Comparison is side-aware
 # - Peerings with no referencing routes are not counted
+#
+# Summary counts are by VPC peering connection.
+# CSV rows are route-table / route level.
 # ==================================================
 
 def check_vpc_peering_routes(session):
@@ -222,20 +209,14 @@ def check_vpc_peering_routes(session):
 
             pcx_arn = f"arn:aws:ec2:{region}:{account_id}:vpc-peering-connection/{pcx_id}"
 
-            requester_info = pcx.get("RequesterVpcInfo", {})
-            accepter_info = pcx.get("AccepterVpcInfo", {})
+            requester_vpc_id = pcx.get("RequesterVpcInfo", {}).get("VpcId", "")
+            accepter_vpc_id = pcx.get("AccepterVpcInfo", {}).get("VpcId", "")
 
-            requester_vpc_id = requester_info.get("VpcId", "")
-            accepter_vpc_id = accepter_info.get("VpcId", "")
-
-            requester_cidrs = get_requester_cidrs(pcx)
-            accepter_cidrs = get_accepter_cidrs(pcx)
+            requester_primary_cidr = get_primary_requester_cidr(pcx)
+            accepter_primary_cidr = get_primary_accepter_cidr(pcx)
 
             peering_has_referencing_route = False
             peering_non_compliant = False
-
-            requester_side_full_cidr = False
-            accepter_side_full_cidr = False
 
             try:
                 paginator = ec2.get_paginator("describe_route_tables")
@@ -260,26 +241,19 @@ def check_vpc_peering_routes(session):
                             peering_has_referencing_route = True
 
                             destination = get_destination(route)
-                            is_default_bad, is_full_peer_bad, side, evidence = evaluate_route(
+                            is_bad, evidence = evaluate_route(
                                 route,
                                 vpc_id,
                                 requester_vpc_id,
                                 accepter_vpc_id,
-                                requester_cidrs,
-                                accepter_cidrs
+                                requester_primary_cidr,
+                                accepter_primary_cidr
                             )
 
-                            row_status = "COMPLIANT"
+                            row_status = "NON_COMPLIANT" if is_bad else "COMPLIANT"
 
-                            if is_default_bad:
-                                row_status = "NON_COMPLIANT"
+                            if is_bad:
                                 peering_non_compliant = True
-
-                            elif is_full_peer_bad:
-                                if side == "requester":
-                                    requester_side_full_cidr = True
-                                elif side == "accepter":
-                                    accepter_side_full_cidr = True
 
                             results.append({
                                 "Region": region,
@@ -306,27 +280,6 @@ def check_vpc_peering_routes(session):
 
             if not peering_has_referencing_route:
                 continue
-
-            # Full-CIDR broadness only fails when both sides are broad
-            if requester_side_full_cidr and accepter_side_full_cidr:
-                peering_non_compliant = True
-
-                # Add an explicit summary/evidence row for the peering-level finding
-                results.append({
-                    "Region": region,
-                    "VpcPeeringConnectionId": pcx_id,
-                    "VpcPeeringConnectionArn": pcx_arn,
-                    "VpcPeeringStatus": pcx_status,
-                    "RouteTableId": "",
-                    "RouteTableName": "",
-                    "VpcId": "",
-                    "Destination": "",
-                    "Status": "NON_COMPLIANT",
-                    "Evidence": (
-                        "Both requester and accepter sides contain full peer VPC CIDR "
-                        "routes to the peering connection"
-                    )
-                })
 
             total_peerings += 1
 
@@ -387,7 +340,7 @@ def write_csv(account_id, results):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="VPC peering connection route tables do not include 0.0.0.0/0 or full requester/accepter VPC CIDR routes"
+        description="VPC peering connection route tables do not include 0.0.0.0/0 or whole requester/accepter VPC CIDR routes"
     )
 
     parser.add_argument("-R", "--role-arn", help="Role ARN")
@@ -400,7 +353,7 @@ def main():
         check_vpc_peering_routes(session)
 
     print("\n====================================================")
-    print("CONTROL: VPC Peering Connection Route Tables Do Not Include 0.0.0.0/0 Or Entire Requester/Accepter VPC CIDR Routes")
+    print("CONTROL: VPC Peering Connection Route Tables Do Not Include 0.0.0.0/0 Or Whole Requester/Accepter VPC CIDR Routes")
     print(f"ACCOUNT: {account_id}")
     print("====================================================\n")
 
