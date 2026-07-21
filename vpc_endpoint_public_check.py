@@ -5,45 +5,33 @@ Control:
     VPC endpoint policy allows access only from trusted AWS accounts
 
 Purpose:
-    1. Evaluate the endpoint policy technically.
-    2. Assess whether an endpoint with an open/untrusted policy has practical
-       cross-account or external network exposure.
-    3. Produce one clear summary row per VPC endpoint and detailed evidence rows.
+    The endpoint policy is recorded separately.
 
-Important:
-    Network restrictions do not make an open endpoint policy technically compliant.
-    They may reduce practical risk, resulting in EffectiveRiskStatus=MITIGATED.
+    The main NetworkComplianceStatus answers:
+        Can an untrusted account or external network practically reach
+        and use this VPC endpoint based on network configuration?
 
-Supported endpoint types:
-    - Gateway
-    - Interface
-    - GatewayLoadBalancer
-    - Resource
-    - ServiceNetwork
-    - Other endpoint types returned by EC2
+Gateway endpoint checks:
+    - S3 and DynamoDB gateway endpoints
+    - Endpoint-associated route tables
+    - Subnets actually using those route tables
+    - AWS RAM shared-subnet participant accounts
+    - Peering/TGW/VPN/DX are NOT treated as gateway-endpoint paths
+
+Interface endpoint checks:
+    - Endpoint ENI subnets
+    - Actual route table for each endpoint subnet
+    - Active cross-account VPC peering
+    - Transit Gateway cross-account connectivity
+    - AWS RAM shared subnets
+    - VPN / virtual private gateway routes
+    - Cloud WAN and Local Gateway route indicators
+    - Endpoint security-group inbound rules
+    - Matching route + matching security-group source correlation
 
 Outputs:
-    1. vpc_endpoint_trusted_accounts_summary_<account>.csv
-    2. vpc_endpoint_trusted_accounts_evidence_<account>.csv
-
-Required permissions may include:
-    ec2:DescribeRegions
-    ec2:DescribeVpcEndpoints
-    ec2:DescribeVpcs
-    ec2:DescribeSubnets
-    ec2:DescribeRouteTables
-    ec2:DescribeSecurityGroups
-    ec2:DescribeVpcPeeringConnections
-    ec2:DescribeTransitGatewayAttachments
-    ec2:DescribeTransitGatewayVpcAttachments
-    ec2:DescribeVpnGateways
-    ec2:DescribeVpnConnections
-    ec2:DescribeNetworkInterfaces
-    ram:GetResourceShares
-    ram:ListResources
-    ram:ListPrincipals
-    sts:GetCallerIdentity
-    sts:AssumeRole
+    vpc_endpoint_network_access_<account>.csv
+    vpc_endpoint_network_evidence_<account>.csv
 """
 
 import argparse
@@ -72,9 +60,15 @@ CONTROL_NAME = (
 
 ACTIVE_ENDPOINT_STATES = {
     "available",
-    "pendingAcceptance",
     "pending",
+    "pendingAcceptance",
 }
+
+ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
+
+ARN_ACCOUNT_RE = re.compile(
+    r"^arn:(?:aws|aws-us-gov|aws-cn):[^:]*:[^:]*:(\d{12}):"
+)
 
 TRUST_CONDITION_KEYS = {
     "aws:principalaccount",
@@ -82,20 +76,85 @@ TRUST_CONDITION_KEYS = {
     "aws:sourceaccount",
 }
 
-ACCOUNT_ID_PATTERN = re.compile(r"^\d{12}$")
-ARN_ACCOUNT_PATTERN = re.compile(
-    r"^arn:(?:aws|aws-us-gov|aws-cn):[^:]*:[^:]*:(\d{12}):"
-)
+SUMMARY_FIELDS = [
+    "Account",
+    "Region",
+    "Control",
 
-BROAD_IPV4 = ipaddress.ip_network("0.0.0.0/0")
-BROAD_IPV6 = ipaddress.ip_network("::/0")
+    # Main result columns
+    "NetworkComplianceStatus",
+    "AccessibleByUntrustedSource",
+    "NonComplianceReason",
+    "RecommendedAction",
+
+    # Endpoint identity
+    "VpcEndpointId",
+    "VpcEndpointArn",
+    "EndpointName",
+    "EndpointType",
+    "GatewayService",
+    "State",
+    "VpcId",
+    "ServiceName",
+
+    # Clear network evidence
+    "NetworkPathType",
+    "UntrustedSourceAccount",
+    "UntrustedSourceNetwork",
+    "MatchingRoute",
+    "PermittingSecurityGroupRule",
+    "RouteValidationStatus",
+    "SecurityGroupValidationStatus",
+    "NetworkConfidence",
+
+    # Gateway endpoint details
+    "GatewayEndpointRouteTableIds",
+    "GatewayEndpointEffectiveSubnetIds",
+    "GatewayEndpointSharedSubnetAccounts",
+
+    # Interface endpoint details
+    "InterfaceEndpointSubnetIds",
+    "InterfaceEndpointSecurityGroupIds",
+    "InterfaceEndpointEniIds",
+
+    # Policy shown separately
+    "PolicyTechnicalStatus",
+    "PolicyContainsWildcard",
+    "PolicyUntrustedPrincipals",
+    "PolicyFinding",
+
+    # Supporting result
+    "NetworkFinding",
+    "EvaluationStatus",
+    "Error",
+]
+
+EVIDENCE_FIELDS = [
+    "Account",
+    "Region",
+    "VpcEndpointId",
+    "EndpointType",
+    "ServiceName",
+    "NetworkComplianceStatus",
+    "EvidenceType",
+    "ResourceId",
+    "SourceAccount",
+    "SourceNetwork",
+    "RouteTableId",
+    "RouteDestination",
+    "RouteTarget",
+    "SecurityGroupId",
+    "SecurityGroupRule",
+    "Result",
+    "Detail",
+]
 
 
 # ============================================================
 # AUTHENTICATION
 # ============================================================
 
-def get_session(role_arn: Optional[str] = None) -> boto3.Session:
+def get_session(role_arn: Optional[str]) -> boto3.Session:
     if not role_arn:
         return boto3.Session()
 
@@ -104,7 +163,7 @@ def get_session(role_arn: Optional[str] = None) -> boto3.Session:
 
     response = sts.assume_role(
         RoleArn=role_arn,
-        RoleSessionName="vpc-endpoint-trusted-accounts-audit",
+        RoleSessionName="vpc-endpoint-network-access-audit",
     )
 
     credentials = response["Credentials"]
@@ -120,24 +179,32 @@ def get_account_id(session: boto3.Session) -> str:
     return session.client("sts").get_caller_identity()["Account"]
 
 
+def get_partition(session: boto3.Session) -> str:
+    region = session.region_name or "us-east-1"
+
+    if region.startswith("cn-"):
+        return "aws-cn"
+
+    if region.startswith("us-gov-"):
+        return "aws-us-gov"
+
+    return "aws"
+
+
 # ============================================================
-# COMMON HELPERS
+# BASIC HELPERS
 # ============================================================
 
-def error_code(error: Exception) -> str:
+def error_text(error: Exception) -> str:
     if isinstance(error, ClientError):
-        return error.response.get("Error", {}).get("Code", type(error).__name__)
-    return type(error).__name__
+        code = error.response.get("Error", {}).get("Code", "ClientError")
+        message = error.response.get("Error", {}).get(
+            "Message",
+            str(error),
+        )
+        return f"{code}: {message}"
 
-
-def error_message(error: Exception) -> str:
-    if isinstance(error, ClientError):
-        return error.response.get("Error", {}).get("Message", str(error))
-    return str(error)
-
-
-def compact_error(error: Exception) -> str:
-    return f"{error_code(error)}: {error_message(error)}"
+    return f"{type(error).__name__}: {error}"
 
 
 def normalize_list(value: Any) -> List[Any]:
@@ -159,6 +226,7 @@ def unique_strings(values: Iterable[Any]) -> List[str]:
             continue
 
         text = str(value).strip()
+
         if not text or text in seen:
             continue
 
@@ -168,14 +236,11 @@ def unique_strings(values: Iterable[Any]) -> List[str]:
     return output
 
 
-def get_name_tag(resource: Dict[str, Any]) -> str:
-    for tag in resource.get("Tags", []) or []:
-        if tag.get("Key") == "Name":
-            return tag.get("Value", "")
-    return ""
+def join_values(values: Iterable[Any]) -> str:
+    return "; ".join(unique_strings(values))
 
 
-def json_string(value: Any) -> str:
+def json_text(value: Any) -> str:
     return json.dumps(
         value,
         separators=(",", ":"),
@@ -184,8 +249,12 @@ def json_string(value: Any) -> str:
     )
 
 
-def join_values(values: Iterable[Any]) -> str:
-    return ";".join(unique_strings(values))
+def get_name_tag(resource: Dict[str, Any]) -> str:
+    for tag in resource.get("Tags", []) or []:
+        if tag.get("Key") == "Name":
+            return tag.get("Value", "")
+
+    return ""
 
 
 def endpoint_arn(
@@ -200,35 +269,6 @@ def endpoint_arn(
     )
 
 
-def get_partition(session: boto3.Session) -> str:
-    region = session.region_name or "us-east-1"
-
-    if region.startswith("us-gov-"):
-        return "aws-us-gov"
-
-    if region.startswith("cn-"):
-        return "aws-cn"
-
-    return "aws"
-
-
-def get_enabled_regions(session: boto3.Session) -> List[str]:
-    ec2 = session.client("ec2", region_name="us-east-1")
-
-    response = ec2.describe_regions(AllRegions=True)
-
-    regions = [
-        item["RegionName"]
-        for item in response.get("Regions", [])
-        if item.get("OptInStatus") in {
-            "opt-in-not-required",
-            "opted-in",
-        }
-    ]
-
-    return sorted(regions)
-
-
 def paginate_items(
     client: Any,
     operation_name: str,
@@ -236,349 +276,312 @@ def paginate_items(
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     paginator = client.get_paginator(operation_name)
-    items: List[Dict[str, Any]] = []
+    output: List[Dict[str, Any]] = []
 
     for page in paginator.paginate(**kwargs):
-        items.extend(page.get(result_key, []))
+        output.extend(page.get(result_key, []))
 
-    return items
+    return output
 
 
-def timestamp_to_text(value: Any) -> str:
-    if value is None:
-        return ""
+def get_enabled_regions(session: boto3.Session) -> List[str]:
+    ec2 = session.client("ec2", region_name="us-east-1")
 
+    response = ec2.describe_regions(AllRegions=True)
+
+    return sorted(
+        region["RegionName"]
+        for region in response.get("Regions", [])
+        if region.get("OptInStatus") in {
+            "opt-in-not-required",
+            "opted-in",
+        }
+    )
+
+
+def parse_network(cidr: str) -> Optional[ipaddress._BaseNetwork]:
     try:
-        return value.isoformat()
-    except AttributeError:
-        return str(value)
+        return ipaddress.ip_network(cidr, strict=False)
+    except (ValueError, TypeError):
+        return None
 
 
-# ============================================================
-# POLICY PARSING
-# ============================================================
+def network_contains(
+    covering_cidr: str,
+    source_cidr: str,
+) -> bool:
+    covering = parse_network(covering_cidr)
+    source = parse_network(source_cidr)
 
-def decode_policy_document(policy_document: Any) -> Dict[str, Any]:
-    if not policy_document:
-        return {}
+    if not covering or not source:
+        return False
 
-    if isinstance(policy_document, dict):
-        return policy_document
-
-    if not isinstance(policy_document, str):
-        raise ValueError(
-            f"Unsupported policy document type: {type(policy_document).__name__}"
+    return (
+        covering.version == source.version
+        and (
+            source.subnet_of(covering)
+            or source.overlaps(covering)
         )
-
-    candidates = [policy_document]
-
-    try:
-        decoded = unquote(policy_document)
-        if decoded != policy_document:
-            candidates.append(decoded)
-    except Exception:
-        pass
-
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    raise ValueError("PolicyDocument could not be decoded as JSON")
+    )
 
 
-def extract_account_from_principal(principal: str) -> Optional[str]:
-    principal = principal.strip()
+def is_broad_cidr(cidr: str) -> bool:
+    network = parse_network(cidr)
 
-    if ACCOUNT_ID_PATTERN.fullmatch(principal):
-        return principal
+    if not network:
+        return False
 
-    match = ARN_ACCOUNT_PATTERN.match(principal)
+    return (
+        network == ipaddress.ip_network("0.0.0.0/0")
+        or network == ipaddress.ip_network("::/0")
+    )
+
+
+def extract_account_from_arn(value: str) -> Optional[str]:
+    value = value.strip()
+
+    if ACCOUNT_ID_RE.fullmatch(value):
+        return value
+
+    match = ARN_ACCOUNT_RE.match(value)
+
     if match:
         return match.group(1)
 
     return None
 
 
-def flatten_principal(principal: Any) -> List[str]:
-    """
-    Returns all principal representations in a simple list.
+def principal_is_trusted(
+    principal: str,
+    trusted_accounts: Set[str],
+) -> bool:
+    principal = principal.strip()
 
-    Examples:
-        "*"
-        {"AWS": "*"}
-        {"AWS": ["arn:aws:iam::111122223333:root"]}
-        {"Service": "ec2.amazonaws.com"}
-    """
-    values: List[str] = []
+    if ACCOUNT_ID_RE.fullmatch(principal):
+        return principal in trusted_accounts
+
+    account = extract_account_from_arn(principal)
+
+    if account:
+        return account in trusted_accounts
+
+    # Organization or OU ARNs cannot be safely resolved into all member
+    # accounts without Organizations permissions.
+    return False
+
+
+# ============================================================
+# POLICY INFORMATION
+# ============================================================
+
+def decode_policy(policy: Any) -> Dict[str, Any]:
+    if not policy:
+        return {}
+
+    if isinstance(policy, dict):
+        return policy
+
+    if not isinstance(policy, str):
+        raise ValueError(
+            f"Unsupported policy type: {type(policy).__name__}"
+        )
+
+    candidates = [policy]
+
+    decoded = unquote(policy)
+
+    if decoded != policy:
+        candidates.append(decoded)
+
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("Endpoint policy could not be decoded as JSON")
+
+
+def flatten_principal(principal: Any) -> List[Tuple[str, str]]:
+    output: List[Tuple[str, str]] = []
 
     if principal is None:
-        return values
+        return output
 
     if isinstance(principal, str):
-        return [principal]
+        return [("AWS", principal)]
 
     if isinstance(principal, list):
         for item in principal:
-            values.extend(flatten_principal(item))
-        return values
+            output.extend(flatten_principal(item))
 
-    if isinstance(principal, dict):
-        for principal_type, principal_value in principal.items():
-            for item in normalize_list(principal_value):
-                values.append(f"{principal_type}:{item}")
-        return values
-
-    values.append(str(principal))
-    return values
-
-
-def condition_values(
-    condition: Any,
-    wanted_keys: Set[str],
-) -> Dict[str, List[str]]:
-    output: Dict[str, List[str]] = defaultdict(list)
-
-    if not isinstance(condition, dict):
         return output
 
+    if isinstance(principal, dict):
+        for principal_type, values in principal.items():
+            for value in normalize_list(values):
+                output.append(
+                    (str(principal_type), str(value))
+                )
+
+        return output
+
+    return [("UNKNOWN", str(principal))]
+
+
+def condition_account_restrictions(
+    condition: Any,
+) -> Tuple[Set[str], bool]:
+    accounts: Set[str] = set()
+    recognized = False
+
+    if not isinstance(condition, dict):
+        return accounts, recognized
+
     for operator, condition_block in condition.items():
+        operator_text = str(operator).lower()
+
+        # Negative conditions are not treated as a trusted allow-list.
+        if "not" in operator_text:
+            continue
+
         if not isinstance(condition_block, dict):
             continue
 
-        operator_lower = str(operator).lower()
-
-        for key, value in condition_block.items():
+        for key, values in condition_block.items():
             key_lower = str(key).lower()
 
-            if key_lower not in wanted_keys:
+            if key_lower not in TRUST_CONDITION_KEYS:
                 continue
 
-            for item in normalize_list(value):
-                output[f"{operator_lower}:{key_lower}"].append(str(item))
+            recognized = True
 
-    return dict(output)
+            for value in normalize_list(values):
+                text = str(value)
 
+                if key_lower in {
+                    "aws:principalaccount",
+                    "aws:sourceaccount",
+                }:
+                    if ACCOUNT_ID_RE.fullmatch(text):
+                        accounts.add(text)
 
-def trusted_accounts_from_conditions(
-    condition: Any,
-) -> Tuple[Set[str], bool, List[str]]:
-    """
-    Returns:
-        account IDs found in recognized restricting conditions,
-        whether all recognized values were parseable,
-        textual condition evidence.
+                elif key_lower == "aws:principalarn":
+                    account = extract_account_from_arn(text)
 
-    This does not attempt to be a complete IAM policy simulator.
-    """
-    discovered_accounts: Set[str] = set()
-    all_parseable = True
-    evidence: List[str] = []
+                    if account:
+                        accounts.add(account)
 
-    values = condition_values(condition, TRUST_CONDITION_KEYS)
-
-    for operator_key, entries in values.items():
-        operator, key = operator_key.split(":", 1)
-
-        evidence.append(f"{operator}:{key}={entries}")
-
-        # Negative operators do not create a trusted allow-list.
-        if "not" in operator:
-            all_parseable = False
-            continue
-
-        for entry in entries:
-            if key in {"aws:principalaccount", "aws:sourceaccount"}:
-                if ACCOUNT_ID_PATTERN.fullmatch(entry):
-                    discovered_accounts.add(entry)
-                else:
-                    all_parseable = False
-
-            elif key == "aws:principalarn":
-                account = extract_account_from_principal(entry)
-
-                if account:
-                    discovered_accounts.add(account)
-                else:
-                    all_parseable = False
-
-    return discovered_accounts, all_parseable, evidence
+    return accounts, recognized
 
 
-def evaluate_policy(
+def evaluate_policy_information(
     policy_document: Dict[str, Any],
     trusted_accounts: Set[str],
 ) -> Dict[str, Any]:
-    """
-    Technical evaluation of Allow statements.
+    statements = normalize_list(
+        policy_document.get("Statement")
+    )
 
-    COMPLIANT:
-        All account-based AWS principals are trusted, or wildcard principal
-        is restricted by a recognized trusted-account condition.
-
-    NON_COMPLIANT:
-        Wildcard principal without trusted-account restriction, or explicit
-        AWS principal from an untrusted account.
-
-    REVIEW:
-        Complex IAM constructs cannot safely be resolved by this script.
-    """
-    statements = normalize_list(policy_document.get("Statement"))
-
-    if not statements:
-        return {
-            "TechnicalStatus": "REVIEW",
-            "PolicyFinding": "Policy contains no readable Statement entries",
-            "WildcardPrincipal": False,
-            "TrustedPrincipals": [],
-            "UntrustedPrincipals": [],
-            "ServicePrincipals": [],
-            "ComplexStatements": [],
-        }
-
-    wildcard_principal = False
-    trusted_principals: List[str] = []
+    wildcard = False
     untrusted_principals: List[str] = []
-    service_principals: List[str] = []
-    complex_statements: List[str] = []
-    granting_statements = 0
+    complex_elements: List[str] = []
+    allow_statement_seen = False
 
     for index, statement in enumerate(statements, start=1):
         if not isinstance(statement, dict):
-            complex_statements.append(
-                f"Statement {index}: statement is not an object"
+            complex_elements.append(
+                f"Statement {index} is not an object"
             )
             continue
 
-        effect = str(statement.get("Effect", "")).lower()
-
-        # Deny statements do not independently grant access.
-        if effect != "allow":
+        if str(statement.get("Effect", "")).lower() != "allow":
             continue
 
-        granting_statements += 1
+        allow_statement_seen = True
 
         if "NotPrincipal" in statement:
-            complex_statements.append(
-                f"Statement {index}: uses NotPrincipal"
+            complex_elements.append(
+                f"Statement {index} uses NotPrincipal"
             )
             continue
 
-        if "NotAction" in statement:
-            complex_statements.append(
-                f"Statement {index}: uses NotAction"
+        condition_accounts, recognized_condition = (
+            condition_account_restrictions(
+                statement.get("Condition", {})
             )
-
-        if "NotResource" in statement:
-            complex_statements.append(
-                f"Statement {index}: uses NotResource"
-            )
-
-        principals = flatten_principal(statement.get("Principal"))
-        condition = statement.get("Condition", {})
-
-        condition_accounts, condition_parseable, condition_evidence = (
-            trusted_accounts_from_conditions(condition)
         )
 
-        for principal in principals:
-            raw_principal = principal
-
-            if ":" in principal:
-                principal_type, principal_value = principal.split(":", 1)
-            else:
-                principal_type = "AWS"
-                principal_value = principal
-
-            principal_type_lower = principal_type.lower()
-            principal_value = principal_value.strip()
-
-            if principal_type_lower == "service":
-                service_principals.append(principal_value)
-                continue
-
-            if principal_type_lower not in {"aws", "federated", "canonicaluser"}:
-                complex_statements.append(
-                    f"Statement {index}: unsupported principal type "
-                    f"{principal_type}"
-                )
+        for principal_type, principal_value in flatten_principal(
+            statement.get("Principal")
+        ):
+            if principal_type.lower() == "service":
                 continue
 
             if principal_value == "*":
-                wildcard_principal = True
+                wildcard = True
 
-                if (
-                    condition_accounts
-                    and condition_parseable
-                    and condition_accounts.issubset(trusted_accounts)
+                if not (
+                    recognized_condition
+                    and condition_accounts
+                    and condition_accounts.issubset(
+                        trusted_accounts
+                    )
                 ):
-                    trusted_principals.append(
-                        f"{raw_principal} restricted by "
-                        f"{sorted(condition_accounts)}"
+                    untrusted_principals.append(
+                        "Wildcard principal without a recognized "
+                        "trusted-account restriction"
                     )
-                else:
-                    reason = (
-                        f"{raw_principal} without a recognized trusted-account "
-                        f"restriction"
-                    )
-
-                    if condition_evidence:
-                        reason += f"; conditions={condition_evidence}"
-
-                    untrusted_principals.append(reason)
 
                 continue
 
-            account = extract_account_from_principal(principal_value)
+            account = extract_account_from_arn(
+                principal_value
+            )
 
-            if account:
-                if account in trusted_accounts:
-                    trusted_principals.append(principal_value)
-                else:
-                    untrusted_principals.append(principal_value)
-            else:
-                complex_statements.append(
-                    f"Statement {index}: principal cannot be mapped to an "
-                    f"AWS account: {principal_value}"
+            if account and account not in trusted_accounts:
+                untrusted_principals.append(
+                    principal_value
                 )
 
-    if granting_statements == 0:
-        return {
-            "TechnicalStatus": "REVIEW",
-            "PolicyFinding": "No Allow statements were found",
-            "WildcardPrincipal": wildcard_principal,
-            "TrustedPrincipals": trusted_principals,
-            "UntrustedPrincipals": untrusted_principals,
-            "ServicePrincipals": service_principals,
-            "ComplexStatements": complex_statements,
-        }
+            elif not account:
+                complex_elements.append(
+                    f"Principal could not be mapped to an account: "
+                    f"{principal_value}"
+                )
 
-    if untrusted_principals:
+    if not allow_statement_seen:
+        status = "REVIEW"
+        finding = "No readable Allow statement was identified"
+
+    elif untrusted_principals:
         status = "NON_COMPLIANT"
         finding = (
-            "Endpoint policy permits wildcard or untrusted AWS principals"
+            "Policy permits wildcard or untrusted principals"
         )
-    elif complex_statements:
+
+    elif complex_elements:
         status = "REVIEW"
         finding = (
-            "No confirmed untrusted principal was identified, but complex "
-            "policy elements require manual review"
+            "No confirmed untrusted principal found, but policy "
+            "contains elements requiring manual review"
         )
+
     else:
         status = "COMPLIANT"
-        finding = "Endpoint policy grants access only to trusted AWS accounts"
+        finding = (
+            "Policy principals are restricted to trusted accounts"
+        )
 
     return {
-        "TechnicalStatus": status,
-        "PolicyFinding": finding,
-        "WildcardPrincipal": wildcard_principal,
-        "TrustedPrincipals": trusted_principals,
+        "Status": status,
+        "Wildcard": wildcard,
         "UntrustedPrincipals": untrusted_principals,
-        "ServicePrincipals": service_principals,
-        "ComplexStatements": complex_statements,
+        "ComplexElements": complex_elements,
+        "Finding": finding,
     }
 
 
@@ -586,9 +589,8 @@ def evaluate_policy(
 # REGIONAL INVENTORY
 # ============================================================
 
-def load_regional_inventory(
+def load_inventory(
     ec2: Any,
-    include_network_inventory: bool = True,
 ) -> Tuple[Dict[str, Any], List[str]]:
     inventory: Dict[str, Any] = {
         "vpcs": {},
@@ -598,8 +600,6 @@ def load_regional_inventory(
         "peerings": [],
         "tgw_attachments": [],
         "tgw_vpc_attachments": [],
-        "vpn_gateways": [],
-        "vpn_connections": [],
         "network_interfaces": {},
     }
 
@@ -608,8 +608,16 @@ def load_regional_inventory(
     operations = [
         ("describe_vpcs", "Vpcs", "vpcs"),
         ("describe_subnets", "Subnets", "subnets"),
-        ("describe_route_tables", "RouteTables", "route_tables"),
-        ("describe_security_groups", "SecurityGroups", "security_groups"),
+        (
+            "describe_route_tables",
+            "RouteTables",
+            "route_tables",
+        ),
+        (
+            "describe_security_groups",
+            "SecurityGroups",
+            "security_groups",
+        ),
         (
             "describe_vpc_peering_connections",
             "VpcPeeringConnections",
@@ -625,17 +633,12 @@ def load_regional_inventory(
             "TransitGatewayVpcAttachments",
             "tgw_vpc_attachments",
         ),
-        ("describe_vpn_gateways", "VpnGateways", "vpn_gateways"),
-        ("describe_vpn_connections", "VpnConnections", "vpn_connections"),
         (
             "describe_network_interfaces",
             "NetworkInterfaces",
             "network_interfaces",
         ),
     ]
-
-    if not include_network_inventory:
-        operations = operations[:4]
 
     for operation, result_key, inventory_key in operations:
         try:
@@ -647,48 +650,48 @@ def load_regional_inventory(
 
             if inventory_key == "vpcs":
                 inventory[inventory_key] = {
-                    item["VpcId"]: item for item in items
+                    item["VpcId"]: item
+                    for item in items
                 }
 
             elif inventory_key == "subnets":
                 inventory[inventory_key] = {
-                    item["SubnetId"]: item for item in items
+                    item["SubnetId"]: item
+                    for item in items
                 }
 
             elif inventory_key == "security_groups":
                 inventory[inventory_key] = {
-                    item["GroupId"]: item for item in items
+                    item["GroupId"]: item
+                    for item in items
                 }
 
             elif inventory_key == "network_interfaces":
                 inventory[inventory_key] = {
-                    item["NetworkInterfaceId"]: item for item in items
+                    item["NetworkInterfaceId"]: item
+                    for item in items
                 }
 
             else:
                 inventory[inventory_key] = items
 
         except (ClientError, BotoCoreError) as error:
-            errors.append(f"{operation}: {compact_error(error)}")
+            errors.append(
+                f"{operation}: {error_text(error)}"
+            )
 
     return inventory, errors
 
 
 # ============================================================
-# AWS RAM / SHARED SUBNET INVENTORY
+# AWS RAM SHARED SUBNETS
 # ============================================================
 
 def get_shared_subnet_principals(
     session: boto3.Session,
     region: str,
 ) -> Tuple[Dict[str, Set[str]], List[str]]:
-    """
-    Returns:
-        subnet ID -> principals with which the subnet is shared.
-
-    VPC sharing is implemented by sharing subnets, not the entire VPC object.
-    """
-    subnet_principals: Dict[str, Set[str]] = defaultdict(set)
+    output: Dict[str, Set[str]] = defaultdict(set)
     errors: List[str] = []
 
     try:
@@ -725,86 +728,38 @@ def get_shared_subnet_principals(
                     resourceShareArns=[share_arn],
                 )
 
-                principal_values = {
-                    str(item.get("id", "")).strip()
-                    for item in principals
-                    if item.get("id")
+                principal_ids = {
+                    str(principal.get("id"))
+                    for principal in principals
+                    if principal.get("id")
                 }
 
                 for resource in resources:
-                    resource_arn = resource.get("arn", "")
+                    arn = resource.get("arn", "")
 
-                    if ":subnet/" not in resource_arn:
+                    if ":subnet/" not in arn:
                         continue
 
-                    subnet_id = resource_arn.rsplit("/", 1)[-1]
-                    subnet_principals[subnet_id].update(principal_values)
+                    subnet_id = arn.rsplit("/", 1)[-1]
+                    output[subnet_id].update(principal_ids)
 
             except (ClientError, BotoCoreError) as error:
                 errors.append(
-                    f"RAM share {share_arn}: {compact_error(error)}"
+                    f"RAM share {share_arn}: "
+                    f"{error_text(error)}"
                 )
 
     except (ClientError, BotoCoreError) as error:
-        errors.append(f"AWS RAM inventory: {compact_error(error)}")
+        errors.append(
+            f"AWS RAM: {error_text(error)}"
+        )
 
-    return dict(subnet_principals), errors
-
-
-def principal_is_trusted(
-    principal: str,
-    trusted_accounts: Set[str],
-) -> bool:
-    principal = principal.strip()
-
-    if ACCOUNT_ID_PATTERN.fullmatch(principal):
-        return principal in trusted_accounts
-
-    account = extract_account_from_principal(principal)
-    if account:
-        return account in trusted_accounts
-
-    # Organization and OU principals cannot be safely resolved to accounts
-    # by this script alone.
-    return False
+    return dict(output), errors
 
 
 # ============================================================
-# NETWORK ANALYSIS HELPERS
+# ROUTE TABLE HELPERS
 # ============================================================
-
-def vpc_cidrs(vpc: Dict[str, Any]) -> List[str]:
-    cidrs: List[str] = []
-
-    if vpc.get("CidrBlock"):
-        cidrs.append(vpc["CidrBlock"])
-
-    for association in vpc.get("CidrBlockAssociationSet", []) or []:
-        if association.get("CidrBlock"):
-            cidrs.append(association["CidrBlock"])
-
-    for association in vpc.get("Ipv6CidrBlockAssociationSet", []) or []:
-        if association.get("Ipv6CidrBlock"):
-            cidrs.append(association["Ipv6CidrBlock"])
-
-    return unique_strings(cidrs)
-
-
-def subnet_cidrs(subnet: Dict[str, Any]) -> List[str]:
-    cidrs: List[str] = []
-
-    if subnet.get("CidrBlock"):
-        cidrs.append(subnet["CidrBlock"])
-
-    if subnet.get("Ipv6CidrBlock"):
-        cidrs.append(subnet["Ipv6CidrBlock"])
-
-    for association in subnet.get("Ipv6CidrBlockAssociationSet", []) or []:
-        if association.get("Ipv6CidrBlock"):
-            cidrs.append(association["Ipv6CidrBlock"])
-
-    return unique_strings(cidrs)
-
 
 def route_destination(route: Dict[str, Any]) -> str:
     return (
@@ -815,384 +770,591 @@ def route_destination(route: Dict[str, Any]) -> str:
     )
 
 
-def route_target(route: Dict[str, Any]) -> Tuple[str, str]:
-    target_fields = [
-        ("VpcPeeringConnectionId", "PEERING"),
-        ("TransitGatewayId", "TRANSIT_GATEWAY"),
-        ("GatewayId", "GATEWAY"),
-        ("NatGatewayId", "NAT_GATEWAY"),
-        ("NetworkInterfaceId", "NETWORK_INTERFACE"),
-        ("VpcEndpointId", "VPC_ENDPOINT"),
-        ("EgressOnlyInternetGatewayId", "EGRESS_ONLY_IGW"),
-        ("InstanceId", "INSTANCE"),
-        ("LocalGatewayId", "LOCAL_GATEWAY"),
-        ("CarrierGatewayId", "CARRIER_GATEWAY"),
-        ("CoreNetworkArn", "CLOUD_WAN"),
-    ]
+def route_target(
+    route: Dict[str, Any],
+) -> Tuple[str, str]:
+    if route.get("VpcPeeringConnectionId"):
+        return (
+            "VPC_PEERING",
+            route["VpcPeeringConnectionId"],
+        )
 
-    for field, target_type in target_fields:
-        value = route.get(field)
-        if value:
-            return target_type, value
+    if route.get("TransitGatewayId"):
+        return (
+            "TRANSIT_GATEWAY",
+            route["TransitGatewayId"],
+        )
 
-    return "", ""
+    gateway_id = route.get("GatewayId", "")
+
+    if gateway_id.startswith("vgw-"):
+        return (
+            "VIRTUAL_PRIVATE_GATEWAY",
+            gateway_id,
+        )
+
+    if route.get("CoreNetworkArn"):
+        return (
+            "CLOUD_WAN",
+            route["CoreNetworkArn"],
+        )
+
+    if route.get("LocalGatewayId"):
+        return (
+            "LOCAL_GATEWAY",
+            route["LocalGatewayId"],
+        )
+
+    if route.get("VpcEndpointId"):
+        return (
+            "VPC_ENDPOINT",
+            route["VpcEndpointId"],
+        )
+
+    if gateway_id == "local":
+        return ("LOCAL", "local")
+
+    return ("OTHER", gateway_id)
 
 
-def route_tables_for_vpc(
+def resolve_main_route_table(
     route_tables: List[Dict[str, Any]],
     vpc_id: str,
-) -> List[Dict[str, Any]]:
-    return [
-        route_table
-        for route_table in route_tables
-        if route_table.get("VpcId") == vpc_id
-    ]
-
-
-def route_tables_for_subnets(
-    route_tables: List[Dict[str, Any]],
-    subnet_ids: List[str],
-    vpc_id: str,
-) -> List[Dict[str, Any]]:
-    selected: Dict[str, Dict[str, Any]] = {}
-    main_route_table: Optional[Dict[str, Any]] = None
-
-    subnet_set = set(subnet_ids)
-
-    for route_table in route_tables_for_vpc(route_tables, vpc_id):
-        route_table_id = route_table.get("RouteTableId", "")
-
-        for association in route_table.get("Associations", []) or []:
-            if association.get("Main"):
-                main_route_table = route_table
-
-            if association.get("SubnetId") in subnet_set:
-                selected[route_table_id] = route_table
-
-    for subnet_id in subnet_set:
-        explicit = False
-
-        for route_table in selected.values():
-            if any(
-                association.get("SubnetId") == subnet_id
-                for association in route_table.get("Associations", []) or []
-            ):
-                explicit = True
-                break
-
-        if not explicit and main_route_table:
-            selected[main_route_table.get("RouteTableId", "")] = (
-                main_route_table
-            )
-
-    return list(selected.values())
-
-
-def parse_ip_network(cidr: str) -> Optional[ipaddress._BaseNetwork]:
-    try:
-        return ipaddress.ip_network(cidr, strict=False)
-    except (ValueError, TypeError):
-        return None
-
-
-def cidr_overlaps_any(cidr: str, candidates: Iterable[str]) -> bool:
-    network = parse_ip_network(cidr)
-
-    if not network:
-        return False
-
-    for candidate in candidates:
-        candidate_network = parse_ip_network(candidate)
-
-        if (
-            candidate_network
-            and network.version == candidate_network.version
-            and network.overlaps(candidate_network)
-        ):
-            return True
-
-    return False
-
-
-def cidr_is_broad(cidr: str) -> bool:
-    network = parse_ip_network(cidr)
-
-    if not network:
-        return False
-
-    return network == BROAD_IPV4 or network == BROAD_IPV6
-
-
-# ============================================================
-# SECURITY-GROUP ANALYSIS
-# ============================================================
-
-def evaluate_endpoint_security_groups(
-    group_ids: List[str],
-    security_groups: Dict[str, Dict[str, Any]],
-    peer_cidrs: List[str],
-    trusted_accounts: Set[str],
-) -> Dict[str, Any]:
-    """
-    Interface endpoint ingress is normally TCP/443, but endpoint services may
-    use other ports. Therefore all inbound permissions are displayed.
-
-    Exposure categories:
-        RESTRICTED
-        BROAD
-        CROSS_ACCOUNT_PATH_ALLOWED
-        REVIEW
-        UNKNOWN
-    """
-    evidence: List[Dict[str, Any]] = []
-    broad_rules: List[str] = []
-    peer_allowed_rules: List[str] = []
-    referenced_groups: List[str] = []
-    missing_groups: List[str] = []
-
-    for group_id in group_ids:
-        group = security_groups.get(group_id)
-
-        if not group:
-            missing_groups.append(group_id)
+) -> Optional[Dict[str, Any]]:
+    for route_table in route_tables:
+        if route_table.get("VpcId") != vpc_id:
             continue
 
-        for permission in group.get("IpPermissions", []) or []:
-            protocol = permission.get("IpProtocol", "")
-            from_port = permission.get("FromPort", "")
-            to_port = permission.get("ToPort", "")
+        for association in route_table.get(
+            "Associations",
+            [],
+        ) or []:
+            if association.get("Main"):
+                return route_table
 
-            for item in permission.get("IpRanges", []) or []:
-                cidr = item.get("CidrIp", "")
-                description = item.get("Description", "")
+    return None
 
-                row = {
-                    "EvidenceType": "SECURITY_GROUP_IPV4",
-                    "ResourceId": group_id,
-                    "Direction": "INGRESS",
-                    "Protocol": protocol,
-                    "Ports": f"{from_port}-{to_port}",
-                    "Source": cidr,
-                    "Detail": description,
-                }
-                evidence.append(row)
 
-                if cidr_is_broad(cidr):
-                    broad_rules.append(
-                        f"{group_id}:{protocol}:{from_port}-{to_port}:{cidr}"
-                    )
+def resolve_subnet_route_table(
+    route_tables: List[Dict[str, Any]],
+    vpc_id: str,
+    subnet_id: str,
+) -> Optional[Dict[str, Any]]:
+    for route_table in route_tables:
+        if route_table.get("VpcId") != vpc_id:
+            continue
 
-                if peer_cidrs and cidr_overlaps_any(cidr, peer_cidrs):
-                    peer_allowed_rules.append(
-                        f"{group_id}:{protocol}:{from_port}-{to_port}:{cidr}"
-                    )
+        for association in route_table.get(
+            "Associations",
+            [],
+        ) or []:
+            if association.get("SubnetId") == subnet_id:
+                return route_table
 
-            for item in permission.get("Ipv6Ranges", []) or []:
-                cidr = item.get("CidrIpv6", "")
-                description = item.get("Description", "")
+    return resolve_main_route_table(
+        route_tables,
+        vpc_id,
+    )
 
-                row = {
-                    "EvidenceType": "SECURITY_GROUP_IPV6",
-                    "ResourceId": group_id,
-                    "Direction": "INGRESS",
-                    "Protocol": protocol,
-                    "Ports": f"{from_port}-{to_port}",
-                    "Source": cidr,
-                    "Detail": description,
-                }
-                evidence.append(row)
 
-                if cidr_is_broad(cidr):
-                    broad_rules.append(
-                        f"{group_id}:{protocol}:{from_port}-{to_port}:{cidr}"
-                    )
+def endpoint_subnet_route_tables(
+    route_tables: List[Dict[str, Any]],
+    vpc_id: str,
+    subnet_ids: List[str],
+) -> List[Dict[str, Any]]:
+    output: Dict[str, Dict[str, Any]] = {}
 
-                if peer_cidrs and cidr_overlaps_any(cidr, peer_cidrs):
-                    peer_allowed_rules.append(
-                        f"{group_id}:{protocol}:{from_port}-{to_port}:{cidr}"
-                    )
+    for subnet_id in subnet_ids:
+        route_table = resolve_subnet_route_table(
+            route_tables,
+            vpc_id,
+            subnet_id,
+        )
 
-            for item in permission.get("UserIdGroupPairs", []) or []:
-                source_group_id = item.get("GroupId", "")
-                source_account = item.get("UserId", "")
-                source_vpc = item.get("VpcId", "")
+        if route_table and route_table.get("RouteTableId"):
+            output[route_table["RouteTableId"]] = route_table
 
-                referenced_groups.append(
-                    f"{source_group_id}@{source_account or 'unknown-account'}"
+    return list(output.values())
+
+
+def subnet_ids_using_route_table(
+    route_tables: List[Dict[str, Any]],
+    subnets: Dict[str, Dict[str, Any]],
+    vpc_id: str,
+    route_table_id: str,
+) -> List[str]:
+    target_route_table = next(
+        (
+            route_table
+            for route_table in route_tables
+            if route_table.get("RouteTableId")
+            == route_table_id
+        ),
+        None,
+    )
+
+    if not target_route_table:
+        return []
+
+    explicit_subnets = {
+        association.get("SubnetId")
+        for association in target_route_table.get(
+            "Associations",
+            [],
+        ) or []
+        if association.get("SubnetId")
+    }
+
+    is_main = any(
+        association.get("Main")
+        for association in target_route_table.get(
+            "Associations",
+            [],
+        ) or []
+    )
+
+    if not is_main:
+        return sorted(explicit_subnets)
+
+    all_vpc_subnets = {
+        subnet_id
+        for subnet_id, subnet in subnets.items()
+        if subnet.get("VpcId") == vpc_id
+    }
+
+    subnets_with_explicit_association: Set[str] = set()
+
+    for route_table in route_tables:
+        if route_table.get("VpcId") != vpc_id:
+            continue
+
+        for association in route_table.get(
+            "Associations",
+            [],
+        ) or []:
+            subnet_id = association.get("SubnetId")
+
+            if subnet_id:
+                subnets_with_explicit_association.add(
+                    subnet_id
                 )
 
-                evidence.append({
-                    "EvidenceType": "SECURITY_GROUP_REFERENCE",
-                    "ResourceId": group_id,
-                    "Direction": "INGRESS",
-                    "Protocol": protocol,
-                    "Ports": f"{from_port}-{to_port}",
-                    "Source": source_group_id,
-                    "Detail": (
-                        f"SourceAccount={source_account};"
-                        f"SourceVpc={source_vpc}"
-                    ),
-                })
+    main_table_subnets = (
+        all_vpc_subnets
+        - subnets_with_explicit_association
+    )
 
-                if (
-                    source_account
-                    and source_account not in trusted_accounts
-                ):
-                    peer_allowed_rules.append(
-                        f"{group_id}:untrusted-SG-reference:"
-                        f"{source_group_id}@{source_account}"
-                    )
+    return sorted(
+        explicit_subnets | main_table_subnets
+    )
 
-            for item in permission.get("PrefixListIds", []) or []:
-                prefix_list_id = item.get("PrefixListId", "")
 
-                evidence.append({
-                    "EvidenceType": "SECURITY_GROUP_PREFIX_LIST",
-                    "ResourceId": group_id,
-                    "Direction": "INGRESS",
-                    "Protocol": protocol,
-                    "Ports": f"{from_port}-{to_port}",
-                    "Source": prefix_list_id,
-                    "Detail": item.get("Description", ""),
-                })
+# ============================================================
+# GATEWAY ENDPOINT EVALUATION
+# ============================================================
 
-    if broad_rules:
-        posture = "BROAD"
-        finding = "Endpoint security group permits broad inbound access"
+def identify_gateway_service(
+    service_name: str,
+) -> str:
+    lower = service_name.lower()
 
-    elif peer_allowed_rules:
-        posture = "CROSS_ACCOUNT_PATH_ALLOWED"
-        finding = (
-            "Endpoint security group permits a detected cross-account network "
-            "source or untrusted security-group reference"
+    if lower.endswith(".s3"):
+        return "S3"
+
+    if lower.endswith(".dynamodb"):
+        return "DynamoDB"
+
+    return "Other Gateway Service"
+
+
+def evaluate_gateway_endpoint(
+    endpoint: Dict[str, Any],
+    inventory: Dict[str, Any],
+    shared_subnets: Dict[str, Set[str]],
+    trusted_accounts: Set[str],
+) -> Dict[str, Any]:
+    vpc_id = endpoint.get("VpcId", "")
+    route_table_ids = endpoint.get(
+        "RouteTableIds",
+        [],
+    ) or []
+
+    effective_subnet_ids: Set[str] = set()
+    untrusted_shares: List[Dict[str, str]] = []
+    evidence: List[Dict[str, Any]] = []
+
+    for route_table_id in route_table_ids:
+        subnet_ids = subnet_ids_using_route_table(
+            inventory["route_tables"],
+            inventory["subnets"],
+            vpc_id,
+            route_table_id,
         )
 
-    elif missing_groups:
-        posture = "UNKNOWN"
-        finding = "One or more endpoint security groups could not be read"
+        effective_subnet_ids.update(subnet_ids)
 
-    elif referenced_groups:
-        posture = "REVIEW"
-        finding = (
-            "Ingress is restricted by security-group references; confirm the "
-            "source workloads and account ownership"
+        evidence.append({
+            "EvidenceType": "GATEWAY_ROUTE_TABLE",
+            "ResourceId": route_table_id,
+            "SourceAccount": "",
+            "SourceNetwork": "",
+            "RouteTableId": route_table_id,
+            "RouteDestination": "",
+            "RouteTarget": endpoint.get(
+                "VpcEndpointId",
+                "",
+            ),
+            "SecurityGroupId": "",
+            "SecurityGroupRule": "",
+            "Result": "CHECKED",
+            "Detail": (
+                f"Gateway endpoint route table is used by "
+                f"{len(subnet_ids)} subnet(s)"
+            ),
+        })
+
+    for subnet_id in sorted(effective_subnet_ids):
+        for principal in shared_subnets.get(
+            subnet_id,
+            set(),
+        ):
+            if principal_is_trusted(
+                principal,
+                trusted_accounts,
+            ):
+                continue
+
+            item = {
+                "SubnetId": subnet_id,
+                "Principal": principal,
+            }
+
+            untrusted_shares.append(item)
+
+            evidence.append({
+                "EvidenceType": "UNTRUSTED_SHARED_SUBNET",
+                "ResourceId": subnet_id,
+                "SourceAccount": principal,
+                "SourceNetwork": "",
+                "RouteTableId": "",
+                "RouteDestination": "",
+                "RouteTarget": "",
+                "SecurityGroupId": "",
+                "SecurityGroupRule": "",
+                "Result": "ACCESSIBLE",
+                "Detail": (
+                    "Subnet using the gateway endpoint route "
+                    "table is shared with an untrusted principal"
+                ),
+            })
+
+    gateway_service = identify_gateway_service(
+        endpoint.get("ServiceName", "")
+    )
+
+    if not route_table_ids:
+        return {
+            "Status": "REVIEW",
+            "Accessible": "UNDETERMINED",
+            "Reason": (
+                "Gateway endpoint has no readable associated "
+                "route-table IDs"
+            ),
+            "RecommendedAction": (
+                "Verify the gateway endpoint route-table associations"
+            ),
+            "PathType": "GATEWAY_ROUTE_TABLE",
+            "SourceAccount": "",
+            "SourceNetwork": "",
+            "MatchingRoute": "",
+            "PermittingSgRule": "Not applicable",
+            "RouteValidation": "UNDETERMINED",
+            "SgValidation": "NOT_APPLICABLE",
+            "Confidence": "LOW",
+            "Finding": (
+                f"{gateway_service} gateway endpoint could not "
+                f"be fully evaluated"
+            ),
+            "EffectiveSubnetIds": sorted(
+                effective_subnet_ids
+            ),
+            "SharedAccounts": untrusted_shares,
+            "Evidence": evidence,
+        }
+
+    if untrusted_shares:
+        accounts = unique_strings(
+            item["Principal"]
+            for item in untrusted_shares
         )
 
-    else:
-        posture = "RESTRICTED"
-        finding = "No broad or confirmed untrusted ingress rule was identified"
+        return {
+            "Status": "NON_COMPLIANT",
+            "Accessible": "YES",
+            "Reason": (
+                f"{gateway_service} gateway endpoint route tables "
+                f"serve subnets shared with untrusted account(s): "
+                f"{join_values(accounts)}"
+            ),
+            "RecommendedAction": (
+                "Remove untrusted subnet sharing, restrict the "
+                "endpoint policy to approved accounts, or document "
+                "the participant accounts as trusted"
+            ),
+            "PathType": "SHARED_VPC_SUBNET",
+            "SourceAccount": join_values(accounts),
+            "SourceNetwork": "",
+            "MatchingRoute": (
+                "Gateway endpoint associated route table"
+            ),
+            "PermittingSgRule": (
+                "Not applicable to gateway endpoints"
+            ),
+            "RouteValidation": "CONFIRMED",
+            "SgValidation": "NOT_APPLICABLE",
+            "Confidence": "HIGH",
+            "Finding": (
+                "An untrusted participant account can deploy "
+                "resources into a subnet that uses the gateway "
+                "endpoint route table"
+            ),
+            "EffectiveSubnetIds": sorted(
+                effective_subnet_ids
+            ),
+            "SharedAccounts": untrusted_shares,
+            "Evidence": evidence,
+        }
 
     return {
-        "SecurityGroupPosture": posture,
-        "SecurityGroupFinding": finding,
-        "BroadRules": broad_rules,
-        "PeerAllowedRules": peer_allowed_rules,
-        "ReferencedGroups": referenced_groups,
-        "MissingGroups": missing_groups,
+        "Status": "COMPLIANT",
+        "Accessible": "NO",
+        "Reason": (
+            f"No untrusted account was found in subnets using "
+            f"the {gateway_service} gateway endpoint route tables"
+        ),
+        "RecommendedAction": (
+            "No network remediation required. The wildcard "
+            "endpoint policy should still be handled separately."
+        ),
+        "PathType": "GATEWAY_ROUTE_TABLE",
+        "SourceAccount": "",
+        "SourceNetwork": "",
+        "MatchingRoute": (
+            "Endpoint route-table associations checked"
+        ),
+        "PermittingSgRule": (
+            "Not applicable to gateway endpoints"
+        ),
+        "RouteValidation": "CONFIRMED",
+        "SgValidation": "NOT_APPLICABLE",
+        "Confidence": "HIGH",
+        "Finding": (
+            f"{gateway_service} gateway endpoint is limited to "
+            f"resources in the endpoint VPC and no untrusted "
+            f"shared-subnet participant was identified"
+        ),
+        "EffectiveSubnetIds": sorted(
+            effective_subnet_ids
+        ),
+        "SharedAccounts": [],
         "Evidence": evidence,
     }
 
 
 # ============================================================
-# CROSS-ACCOUNT CONNECTIVITY ANALYSIS
+# INTERFACE PATH DISCOVERY
 # ============================================================
 
-def cross_account_peerings(
+def remote_vpc_cidrs(
+    vpc_info: Dict[str, Any],
+) -> List[str]:
+    cidrs: List[str] = []
+
+    if vpc_info.get("CidrBlock"):
+        cidrs.append(vpc_info["CidrBlock"])
+
+    for association in (
+        vpc_info.get("Ipv6CidrBlockSet", [])
+        or vpc_info.get(
+            "Ipv6CidrBlockAssociationSet",
+            [],
+        )
+        or []
+    ):
+        cidr = association.get("Ipv6CidrBlock")
+
+        if cidr:
+            cidrs.append(cidr)
+
+    return unique_strings(cidrs)
+
+
+def discover_peering_paths(
+    endpoint_vpc_id: str,
     peerings: List[Dict[str, Any]],
-    endpoint_vpc_id: str,
-    trusted_accounts: Set[str],
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    matches: List[Dict[str, Any]] = []
-    peer_cidrs: List[str] = []
-
-    for peering in peerings:
-        if peering.get("Status", {}).get("Code") != "active":
-            continue
-
-        requester = peering.get("RequesterVpcInfo", {})
-        accepter = peering.get("AccepterVpcInfo", {})
-
-        local_side: Optional[Dict[str, Any]] = None
-        remote_side: Optional[Dict[str, Any]] = None
-
-        if requester.get("VpcId") == endpoint_vpc_id:
-            local_side = requester
-            remote_side = accepter
-
-        elif accepter.get("VpcId") == endpoint_vpc_id:
-            local_side = accepter
-            remote_side = requester
-
-        if not local_side or not remote_side:
-            continue
-
-        remote_owner = remote_side.get("OwnerId", "")
-
-        if remote_owner in trusted_accounts:
-            continue
-
-        cidrs = []
-
-        if remote_side.get("CidrBlock"):
-            cidrs.append(remote_side["CidrBlock"])
-
-        for association in (
-            remote_side.get("Ipv6CidrBlockSet", [])
-            or remote_side.get("Ipv6CidrBlockAssociationSet", [])
-            or []
-        ):
-            value = association.get("Ipv6CidrBlock")
-            if value:
-                cidrs.append(value)
-
-        peer_cidrs.extend(cidrs)
-
-        matches.append({
-            "PeeringId": peering.get("VpcPeeringConnectionId", ""),
-            "RemoteVpcId": remote_side.get("VpcId", ""),
-            "RemoteOwnerId": remote_owner or "UNKNOWN",
-            "RemoteRegion": remote_side.get("Region", ""),
-            "RemoteCidrs": cidrs,
-        })
-
-    return matches, unique_strings(peer_cidrs)
-
-
-def cross_account_tgw_paths(
-    inventory: Dict[str, Any],
-    endpoint_vpc_id: str,
     trusted_accounts: Set[str],
 ) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
+    paths: List[Dict[str, Any]] = []
 
-    endpoint_tgw_ids: Set[str] = set()
-
-    for attachment in inventory.get("tgw_vpc_attachments", []):
-        if (
-            attachment.get("VpcId") == endpoint_vpc_id
-            and attachment.get("State") in {
-                "available",
-                "pending",
-                "modifying",
-            }
-        ):
-            tgw_id = attachment.get("TransitGatewayId")
-
-            if tgw_id:
-                endpoint_tgw_ids.add(tgw_id)
-
-    if not endpoint_tgw_ids:
-        return results
-
-    for attachment in inventory.get("tgw_attachments", []):
-        tgw_id = attachment.get("TransitGatewayId")
-
-        if tgw_id not in endpoint_tgw_ids:
+    for peering in peerings:
+        if peering.get(
+            "Status",
+            {},
+        ).get("Code") != "active":
             continue
 
-        state = attachment.get("State", "")
+        requester = peering.get(
+            "RequesterVpcInfo",
+            {},
+        )
+        accepter = peering.get(
+            "AccepterVpcInfo",
+            {},
+        )
 
-        if state not in {
+        if requester.get("VpcId") == endpoint_vpc_id:
+            remote = accepter
+
+        elif accepter.get("VpcId") == endpoint_vpc_id:
+            remote = requester
+
+        else:
+            continue
+
+        remote_account = remote.get("OwnerId", "")
+
+        if (
+            remote_account
+            and remote_account in trusted_accounts
+        ):
+            continue
+
+        paths.append({
+            "PathType": "VPC_PEERING",
+            "ConnectionId": peering.get(
+                "VpcPeeringConnectionId",
+                "",
+            ),
+            "SourceAccount": (
+                remote_account or "UNKNOWN"
+            ),
+            "SourceNetworks": remote_vpc_cidrs(
+                remote
+            ),
+            "RemoteVpcId": remote.get("VpcId", ""),
+        })
+
+    return paths
+
+
+def discover_shared_subnet_paths(
+    endpoint: Dict[str, Any],
+    inventory: Dict[str, Any],
+    shared_subnets: Dict[str, Set[str]],
+    trusted_accounts: Set[str],
+) -> List[Dict[str, Any]]:
+    paths: List[Dict[str, Any]] = []
+
+    for subnet_id in endpoint.get(
+        "SubnetIds",
+        [],
+    ) or []:
+        subnet = inventory["subnets"].get(
+            subnet_id,
+            {},
+        )
+
+        subnet_cidr = subnet.get("CidrBlock", "")
+
+        for principal in shared_subnets.get(
+            subnet_id,
+            set(),
+        ):
+            if principal_is_trusted(
+                principal,
+                trusted_accounts,
+            ):
+                continue
+
+            paths.append({
+                "PathType": "SHARED_VPC_SUBNET",
+                "ConnectionId": subnet_id,
+                "SourceAccount": principal,
+                "SourceNetworks": (
+                    [subnet_cidr]
+                    if subnet_cidr
+                    else []
+                ),
+                "RemoteVpcId": endpoint.get(
+                    "VpcId",
+                    "",
+                ),
+            })
+
+    return paths
+
+
+def endpoint_tgw_ids(
+    endpoint_vpc_id: str,
+    inventory: Dict[str, Any],
+) -> Set[str]:
+    output: Set[str] = set()
+
+    for attachment in inventory.get(
+        "tgw_vpc_attachments",
+        [],
+    ):
+        if attachment.get("VpcId") != endpoint_vpc_id:
+            continue
+
+        if attachment.get("State") not in {
+            "available",
+            "pending",
+            "modifying",
+        }:
+            continue
+
+        tgw_id = attachment.get(
+            "TransitGatewayId"
+        )
+
+        if tgw_id:
+            output.add(tgw_id)
+
+    return output
+
+
+def discover_tgw_paths(
+    endpoint_vpc_id: str,
+    endpoint_route_table_list: List[Dict[str, Any]],
+    inventory: Dict[str, Any],
+    trusted_accounts: Set[str],
+) -> List[Dict[str, Any]]:
+    paths: List[Dict[str, Any]] = []
+
+    attached_tgws = endpoint_tgw_ids(
+        endpoint_vpc_id,
+        inventory,
+    )
+
+    if not attached_tgws:
+        return paths
+
+    untrusted_tgws: Set[str] = set()
+
+    for attachment in inventory.get(
+        "tgw_attachments",
+        [],
+    ):
+        tgw_id = attachment.get(
+            "TransitGatewayId",
+            "",
+        )
+
+        if tgw_id not in attached_tgws:
+            continue
+
+        if attachment.get("State") not in {
             "available",
             "pending",
             "modifying",
@@ -1200,470 +1362,721 @@ def cross_account_tgw_paths(
         }:
             continue
 
-        resource_owner = attachment.get("ResourceOwnerId", "")
-        resource_id = attachment.get("ResourceId", "")
-        resource_type = attachment.get("ResourceType", "")
-        tgw_owner = attachment.get("TransitGatewayOwnerId", "")
+        resource_owner = attachment.get(
+            "ResourceOwnerId",
+            "",
+        )
+        tgw_owner = attachment.get(
+            "TransitGatewayOwnerId",
+            "",
+        )
 
-        if resource_id == endpoint_vpc_id:
-            continue
-
-        untrusted_resource_owner = (
+        if (
             resource_owner
             and resource_owner not in trusted_accounts
-        )
-        untrusted_tgw_owner = (
+        ) or (
             tgw_owner
             and tgw_owner not in trusted_accounts
-        )
+        ):
+            untrusted_tgws.add(tgw_id)
 
-        if untrusted_resource_owner or untrusted_tgw_owner:
-            results.append({
-                "TransitGatewayId": tgw_id,
-                "AttachmentId": attachment.get(
-                    "TransitGatewayAttachmentId",
-                    "",
-                ),
-                "ResourceType": resource_type,
-                "ResourceId": resource_id,
-                "ResourceOwnerId": resource_owner or "UNKNOWN",
-                "TransitGatewayOwnerId": tgw_owner or "UNKNOWN",
-                "State": state,
-            })
-
-    return results
-
-
-def external_route_indicators(
-    route_tables: List[Dict[str, Any]],
-    endpoint_vpc_id: str,
-    endpoint_subnets: List[str],
-) -> List[Dict[str, Any]]:
-    """
-    Returns potential external/inter-VPC route indicators.
-
-    This is evidence of possible connectivity, not proof that traffic can
-    successfully reach the endpoint.
-    """
-    selected_route_tables = route_tables_for_subnets(
-        route_tables,
-        endpoint_subnets,
-        endpoint_vpc_id,
-    )
-
-    if not selected_route_tables:
-        selected_route_tables = route_tables_for_vpc(
-            route_tables,
-            endpoint_vpc_id,
-        )
-
-    indicators: List[Dict[str, Any]] = []
-
-    for route_table in selected_route_tables:
-        route_table_id = route_table.get("RouteTableId", "")
-
-        for route in route_table.get("Routes", []) or []:
+    for route_table in endpoint_route_table_list:
+        for route in route_table.get(
+            "Routes",
+            [],
+        ) or []:
             if route.get("State") == "blackhole":
                 continue
 
-            target_type, target_id = route_target(route)
+            tgw_id = route.get("TransitGatewayId")
 
-            relevant = False
-            category = ""
+            if tgw_id not in untrusted_tgws:
+                continue
 
-            if target_type == "PEERING":
-                relevant = True
-                category = "VPC_PEERING_ROUTE"
+            destination = route_destination(route)
 
-            elif target_type == "TRANSIT_GATEWAY":
-                relevant = True
-                category = "TRANSIT_GATEWAY_ROUTE"
+            if not parse_network(destination):
+                continue
 
-            elif (
-                target_type == "GATEWAY"
-                and (
-                    target_id.startswith("vgw-")
-                    or target_id.startswith("lgw-")
-                )
+            paths.append({
+                "PathType": "TRANSIT_GATEWAY",
+                "ConnectionId": tgw_id,
+                "SourceAccount": "UNTRUSTED_OR_EXTERNAL",
+                "SourceNetworks": [destination],
+                "RemoteVpcId": "",
+            })
+
+    return paths
+
+
+def discover_external_gateway_paths(
+    endpoint_route_table_list: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    paths: List[Dict[str, Any]] = []
+
+    for route_table in endpoint_route_table_list:
+        for route in route_table.get(
+            "Routes",
+            [],
+        ) or []:
+            if route.get("State") == "blackhole":
+                continue
+
+            target_type, target_id = route_target(
+                route
+            )
+
+            if target_type not in {
+                "VIRTUAL_PRIVATE_GATEWAY",
+                "CLOUD_WAN",
+                "LOCAL_GATEWAY",
+            }:
+                continue
+
+            destination = route_destination(route)
+
+            if not parse_network(destination):
+                continue
+
+            paths.append({
+                "PathType": target_type,
+                "ConnectionId": target_id,
+                "SourceAccount": "EXTERNAL_NETWORK",
+                "SourceNetworks": [destination],
+                "RemoteVpcId": "",
+            })
+
+    return paths
+
+
+# ============================================================
+# ROUTE CORRELATION
+# ============================================================
+
+def find_matching_route(
+    path: Dict[str, Any],
+    endpoint_route_table_list: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    path_type = path.get("PathType")
+    connection_id = path.get("ConnectionId")
+    source_networks = path.get(
+        "SourceNetworks",
+        [],
+    )
+
+    # A shared-subnet participant is already local to the VPC.
+    if path_type == "SHARED_VPC_SUBNET":
+        return [{
+            "RouteTableId": "LOCAL",
+            "Destination": join_values(source_networks),
+            "Target": "local",
+        }]
+
+    expected_target_type = path_type
+
+    matches: List[Dict[str, str]] = []
+
+    for route_table in endpoint_route_table_list:
+        route_table_id = route_table.get(
+            "RouteTableId",
+            "",
+        )
+
+        for route in route_table.get(
+            "Routes",
+            [],
+        ) or []:
+            if route.get("State") == "blackhole":
+                continue
+
+            target_type, target_id = route_target(
+                route
+            )
+
+            if target_type != expected_target_type:
+                continue
+
+            if (
+                connection_id
+                and target_id != connection_id
             ):
-                relevant = True
-                category = "VPN_OR_DIRECT_CONNECT_ROUTE"
+                continue
 
-            elif target_type in {"LOCAL_GATEWAY", "CLOUD_WAN"}:
-                relevant = True
-                category = f"{target_type}_ROUTE"
+            destination = route_destination(route)
 
-            if relevant:
-                indicators.append({
-                    "RouteTableId": route_table_id,
-                    "Category": category,
-                    "Destination": route_destination(route),
-                    "TargetType": target_type,
-                    "TargetId": target_id,
-                })
+            for source_network in source_networks:
+                if network_contains(
+                    destination,
+                    source_network,
+                ):
+                    matches.append({
+                        "RouteTableId": route_table_id,
+                        "Destination": destination,
+                        "Target": target_id,
+                    })
 
-    return indicators
+    return matches
 
 
 # ============================================================
-# ENDPOINT NETWORK ANALYSIS
+# SECURITY GROUP CORRELATION
 # ============================================================
 
-def evaluate_network_exposure(
+def permission_allows_endpoint_port(
+    permission: Dict[str, Any],
+    endpoint_port: int,
+) -> bool:
+    protocol = str(
+        permission.get("IpProtocol", "")
+    ).lower()
+
+    if protocol == "-1":
+        return True
+
+    if protocol not in {"6", "tcp"}:
+        return False
+
+    from_port = permission.get("FromPort")
+    to_port = permission.get("ToPort")
+
+    if from_port is None or to_port is None:
+        return True
+
+    return (
+        int(from_port)
+        <= endpoint_port
+        <= int(to_port)
+    )
+
+
+def security_group_rule_text(
+    group_id: str,
+    permission: Dict[str, Any],
+    source: str,
+) -> str:
+    protocol = permission.get(
+        "IpProtocol",
+        "",
+    )
+    from_port = permission.get(
+        "FromPort",
+        "ALL",
+    )
+    to_port = permission.get(
+        "ToPort",
+        "ALL",
+    )
+
+    return (
+        f"{group_id}: protocol={protocol}, "
+        f"ports={from_port}-{to_port}, "
+        f"source={source}"
+    )
+
+
+def find_permitting_sg_rules(
+    group_ids: List[str],
+    security_groups: Dict[str, Dict[str, Any]],
+    path: Dict[str, Any],
+    trusted_accounts: Set[str],
+    endpoint_port: int,
+) -> Tuple[List[str], List[str], bool]:
+    """
+    Returns:
+        matching rules,
+        broad rules,
+        whether any security group could not be read.
+    """
+    matching_rules: List[str] = []
+    broad_rules: List[str] = []
+    missing_group = False
+
+    source_networks = path.get(
+        "SourceNetworks",
+        [],
+    )
+    source_account = path.get(
+        "SourceAccount",
+        "",
+    )
+
+    for group_id in group_ids:
+        group = security_groups.get(group_id)
+
+        if not group:
+            missing_group = True
+            continue
+
+        for permission in group.get(
+            "IpPermissions",
+            [],
+        ) or []:
+            if not permission_allows_endpoint_port(
+                permission,
+                endpoint_port,
+            ):
+                continue
+
+            for item in permission.get(
+                "IpRanges",
+                [],
+            ) or []:
+                rule_cidr = item.get("CidrIp", "")
+
+                rule_text = security_group_rule_text(
+                    group_id,
+                    permission,
+                    rule_cidr,
+                )
+
+                if is_broad_cidr(rule_cidr):
+                    broad_rules.append(rule_text)
+
+                for source_network in source_networks:
+                    if network_contains(
+                        rule_cidr,
+                        source_network,
+                    ):
+                        matching_rules.append(
+                            rule_text
+                        )
+
+            for item in permission.get(
+                "Ipv6Ranges",
+                [],
+            ) or []:
+                rule_cidr = item.get(
+                    "CidrIpv6",
+                    "",
+                )
+
+                rule_text = security_group_rule_text(
+                    group_id,
+                    permission,
+                    rule_cidr,
+                )
+
+                if is_broad_cidr(rule_cidr):
+                    broad_rules.append(rule_text)
+
+                for source_network in source_networks:
+                    if network_contains(
+                        rule_cidr,
+                        source_network,
+                    ):
+                        matching_rules.append(
+                            rule_text
+                        )
+
+            for pair in permission.get(
+                "UserIdGroupPairs",
+                [],
+            ) or []:
+                pair_account = pair.get(
+                    "UserId",
+                    "",
+                )
+                pair_group = pair.get(
+                    "GroupId",
+                    "",
+                )
+
+                rule_text = security_group_rule_text(
+                    group_id,
+                    permission,
+                    (
+                        f"{pair_group}@"
+                        f"{pair_account or 'unknown'}"
+                    ),
+                )
+
+                if (
+                    pair_account
+                    and pair_account
+                    == source_account
+                    and pair_account
+                    not in trusted_accounts
+                ):
+                    matching_rules.append(
+                        rule_text
+                    )
+
+    return (
+        unique_strings(matching_rules),
+        unique_strings(broad_rules),
+        missing_group,
+    )
+
+
+# ============================================================
+# INTERFACE ENDPOINT EVALUATION
+# ============================================================
+
+def evaluate_interface_endpoint(
     endpoint: Dict[str, Any],
     inventory: Dict[str, Any],
-    shared_subnet_principals: Dict[str, Set[str]],
+    shared_subnets: Dict[str, Set[str]],
     trusted_accounts: Set[str],
+    endpoint_port: int,
 ) -> Dict[str, Any]:
-    endpoint_type = endpoint.get("VpcEndpointType", "Unknown")
-    endpoint_vpc_id = endpoint.get("VpcId", "")
-    subnet_ids = endpoint.get("SubnetIds", []) or []
+    vpc_id = endpoint.get("VpcId", "")
+    subnet_ids = endpoint.get(
+        "SubnetIds",
+        [],
+    ) or []
+
     group_ids = [
         group.get("GroupId")
-        for group in endpoint.get("Groups", []) or []
+        for group in endpoint.get(
+            "Groups",
+            [],
+        ) or []
         if group.get("GroupId")
     ]
 
+    endpoint_route_tables_list = (
+        endpoint_subnet_route_tables(
+            inventory["route_tables"],
+            vpc_id,
+            subnet_ids,
+        )
+    )
+
+    candidate_paths: List[Dict[str, Any]] = []
+
+    candidate_paths.extend(
+        discover_shared_subnet_paths(
+            endpoint,
+            inventory,
+            shared_subnets,
+            trusted_accounts,
+        )
+    )
+
+    candidate_paths.extend(
+        discover_peering_paths(
+            vpc_id,
+            inventory["peerings"],
+            trusted_accounts,
+        )
+    )
+
+    candidate_paths.extend(
+        discover_tgw_paths(
+            vpc_id,
+            endpoint_route_tables_list,
+            inventory,
+            trusted_accounts,
+        )
+    )
+
+    candidate_paths.extend(
+        discover_external_gateway_paths(
+            endpoint_route_tables_list
+        )
+    )
+
     evidence: List[Dict[str, Any]] = []
+    confirmed_access_paths: List[Dict[str, Any]] = []
+    unresolved_paths: List[Dict[str, Any]] = []
+    broad_sg_rules_seen: List[str] = []
 
-    endpoint_subnet_ids = set(subnet_ids)
+    for path in candidate_paths:
+        matching_routes = find_matching_route(
+            path,
+            endpoint_route_tables_list,
+        )
 
-    # Gateway endpoints do not expose SubnetIds. Evaluate all shared subnets
-    # belonging to the endpoint VPC because workloads in those subnets use
-    # VPC-owner-controlled routing.
-    if endpoint_type == "Gateway":
-        endpoint_subnet_ids = {
-            subnet_id
-            for subnet_id, subnet in inventory.get("subnets", {}).items()
-            if subnet.get("VpcId") == endpoint_vpc_id
-        }
-
-    shared_untrusted_principals: Dict[str, List[str]] = {}
-
-    for subnet_id in endpoint_subnet_ids:
-        principals = shared_subnet_principals.get(subnet_id, set())
-
-        untrusted = sorted(
-            principal
-            for principal in principals
-            if not principal_is_trusted(
-                principal,
+        matching_sg_rules, broad_sg_rules, missing_sg = (
+            find_permitting_sg_rules(
+                group_ids,
+                inventory["security_groups"],
+                path,
                 trusted_accounts,
+                endpoint_port,
             )
         )
 
-        if untrusted:
-            shared_untrusted_principals[subnet_id] = untrusted
+        broad_sg_rules_seen.extend(
+            broad_sg_rules
+        )
 
-            evidence.append({
-                "EvidenceType": "SHARED_SUBNET",
-                "ResourceId": subnet_id,
-                "Direction": "",
-                "Protocol": "",
-                "Ports": "",
-                "Source": join_values(untrusted),
-                "Detail": (
-                    "Subnet is shared through AWS RAM with a principal that "
-                    "is not in the trusted-account list"
+        if matching_routes and matching_sg_rules:
+            confirmed = {
+                **path,
+                "Routes": matching_routes,
+                "SecurityGroupRules": (
+                    matching_sg_rules
+                ),
+            }
+
+            confirmed_access_paths.append(
+                confirmed
+            )
+
+            for matching_route in matching_routes:
+                evidence.append({
+                    "EvidenceType": (
+                        "CONFIRMED_UNTRUSTED_ACCESS_PATH"
+                    ),
+                    "ResourceId": path.get(
+                        "ConnectionId",
+                        "",
+                    ),
+                    "SourceAccount": path.get(
+                        "SourceAccount",
+                        "",
+                    ),
+                    "SourceNetwork": join_values(
+                        path.get(
+                            "SourceNetworks",
+                            [],
+                        )
+                    ),
+                    "RouteTableId": (
+                        matching_route["RouteTableId"]
+                    ),
+                    "RouteDestination": (
+                        matching_route["Destination"]
+                    ),
+                    "RouteTarget": (
+                        matching_route["Target"]
+                    ),
+                    "SecurityGroupId": "",
+                    "SecurityGroupRule": join_values(
+                        matching_sg_rules
+                    ),
+                    "Result": "ACCESSIBLE",
+                    "Detail": (
+                        "Both route and endpoint security-group "
+                        "conditions permit the identified source"
+                    ),
+                })
+
+        elif missing_sg:
+            unresolved_paths.append({
+                **path,
+                "Reason": (
+                    "One or more endpoint security groups "
+                    "could not be read"
                 ),
             })
 
-    peerings, peer_cidrs = cross_account_peerings(
-        inventory.get("peerings", []),
-        endpoint_vpc_id,
-        trusted_accounts,
-    )
+        else:
+            evidence.append({
+                "EvidenceType": "BLOCKED_OR_INCOMPLETE_PATH",
+                "ResourceId": path.get(
+                    "ConnectionId",
+                    "",
+                ),
+                "SourceAccount": path.get(
+                    "SourceAccount",
+                    "",
+                ),
+                "SourceNetwork": join_values(
+                    path.get(
+                        "SourceNetworks",
+                        [],
+                    )
+                ),
+                "RouteTableId": join_values(
+                    route["RouteTableId"]
+                    for route in matching_routes
+                ),
+                "RouteDestination": join_values(
+                    route["Destination"]
+                    for route in matching_routes
+                ),
+                "RouteTarget": join_values(
+                    route["Target"]
+                    for route in matching_routes
+                ),
+                "SecurityGroupId": "",
+                "SecurityGroupRule": join_values(
+                    matching_sg_rules
+                ),
+                "Result": "NOT_CONFIRMED",
+                "Detail": (
+                    "Path was not considered accessible because "
+                    "both a matching route and permitting endpoint "
+                    "security-group rule were not present"
+                ),
+            })
 
-    for item in peerings:
-        evidence.append({
-            "EvidenceType": "CROSS_ACCOUNT_PEERING",
-            "ResourceId": item["PeeringId"],
-            "Direction": "",
-            "Protocol": "",
-            "Ports": "",
-            "Source": item["RemoteOwnerId"],
-            "Detail": json_string(item),
-        })
+    if confirmed_access_paths:
+        first = confirmed_access_paths[0]
 
-    tgw_paths = cross_account_tgw_paths(
-        inventory,
-        endpoint_vpc_id,
-        trusted_accounts,
-    )
+        route_descriptions: List[str] = []
 
-    for item in tgw_paths:
-        evidence.append({
-            "EvidenceType": "CROSS_ACCOUNT_TGW",
-            "ResourceId": item["AttachmentId"],
-            "Direction": "",
-            "Protocol": "",
-            "Ports": "",
-            "Source": item["ResourceOwnerId"],
-            "Detail": json_string(item),
-        })
+        for route in first["Routes"]:
+            route_descriptions.append(
+                f"{route['RouteTableId']}:"
+                f"{route['Destination']} -> "
+                f"{route['Target']}"
+            )
 
-    route_indicators = external_route_indicators(
-        inventory.get("route_tables", []),
-        endpoint_vpc_id,
-        subnet_ids,
-    )
-
-    for item in route_indicators:
-        evidence.append({
-            "EvidenceType": item["Category"],
-            "ResourceId": item["RouteTableId"],
-            "Direction": "",
-            "Protocol": "",
-            "Ports": "",
-            "Source": item["Destination"],
-            "Detail": (
-                f"TargetType={item['TargetType']};"
-                f"TargetId={item['TargetId']}"
+        return {
+            "Status": "NON_COMPLIANT",
+            "Accessible": "YES",
+            "Reason": (
+                f"Interface endpoint is reachable from an "
+                f"untrusted source through "
+                f"{first['PathType']}; a matching route and "
+                f"endpoint security-group rule were confirmed"
             ),
-        })
+            "RecommendedAction": (
+                "Restrict the endpoint security-group source, "
+                "remove the untrusted network route/attachment, "
+                "or add the approved account to the trusted list"
+            ),
+            "PathType": first["PathType"],
+            "SourceAccount": first.get(
+                "SourceAccount",
+                "",
+            ),
+            "SourceNetwork": join_values(
+                first.get("SourceNetworks", [])
+            ),
+            "MatchingRoute": join_values(
+                route_descriptions
+            ),
+            "PermittingSgRule": join_values(
+                first["SecurityGroupRules"]
+            ),
+            "RouteValidation": "CONFIRMED",
+            "SgValidation": "CONFIRMED",
+            "Confidence": "HIGH",
+            "Finding": (
+                "A complete untrusted network path exists: "
+                "source connectivity, return routing and endpoint "
+                "security-group permission were all identified"
+            ),
+            "BroadSgRules": unique_strings(
+                broad_sg_rules_seen
+            ),
+            "Evidence": evidence,
+        }
 
-    security_group_result = {
-        "SecurityGroupPosture": "NOT_APPLICABLE",
-        "SecurityGroupFinding": (
-            "Endpoint type does not use endpoint security groups"
-        ),
-        "BroadRules": [],
-        "PeerAllowedRules": [],
-        "ReferencedGroups": [],
-        "MissingGroups": [],
-        "Evidence": [],
-    }
-
-    if endpoint_type in {"Interface", "GatewayLoadBalancer"}:
-        security_group_result = evaluate_endpoint_security_groups(
-            group_ids,
-            inventory.get("security_groups", {}),
-            peer_cidrs,
-            trusted_accounts,
-        )
-
-        evidence.extend(security_group_result["Evidence"])
-
-    network_exposure = "RESTRICTED"
-    network_finding = (
-        "No confirmed untrusted endpoint network path was identified"
-    )
-    confidence = "MEDIUM"
-
-    if endpoint_type == "Gateway":
-        # Gateway endpoints do not support access through peering, TGW,
-        # VPN or Direct Connect. Shared-subnet participants remain relevant.
-        if shared_untrusted_principals:
-            network_exposure = "POTENTIAL_CROSS_ACCOUNT"
-            network_finding = (
-                "Resources owned by an untrusted account may be placed in "
-                "shared subnets of the endpoint VPC"
-            )
-            confidence = "HIGH"
-        else:
-            network_exposure = "RESTRICTED"
-            network_finding = (
-                "No untrusted VPC-subnet sharing was identified. Gateway "
-                "endpoints are not reachable through VPC peering, Transit "
-                "Gateway, VPN or Direct Connect."
-            )
-            confidence = "MEDIUM"
-
-    elif endpoint_type == "Interface":
-        sg_posture = security_group_result["SecurityGroupPosture"]
-
-        if shared_untrusted_principals and sg_posture in {
-            "BROAD",
-            "CROSS_ACCOUNT_PATH_ALLOWED",
-            "REVIEW",
-        }:
-            network_exposure = "POTENTIAL_CROSS_ACCOUNT"
-            network_finding = (
-                "Endpoint subnets are shared with untrusted principals and "
-                "endpoint security groups do not conclusively prevent access"
-            )
-            confidence = "HIGH"
-
-        elif sg_posture == "BROAD":
-            if peerings or tgw_paths or route_indicators:
-                network_exposure = "BROAD"
-                network_finding = (
-                    "Endpoint security groups allow broad inbound access and "
-                    "the VPC has external or cross-account connectivity "
-                    "indicators"
+    if unresolved_paths:
+        return {
+            "Status": "REVIEW",
+            "Accessible": "UNDETERMINED",
+            "Reason": (
+                "Network accessibility could not be fully "
+                "determined because one or more endpoint "
+                "security groups or path details could not be read"
+            ),
+            "RecommendedAction": (
+                "Review the endpoint security groups and the "
+                "evidence CSV for missing permissions"
+            ),
+            "PathType": join_values(
+                path.get("PathType", "")
+                for path in unresolved_paths
+            ),
+            "SourceAccount": join_values(
+                path.get("SourceAccount", "")
+                for path in unresolved_paths
+            ),
+            "SourceNetwork": join_values(
+                network
+                for path in unresolved_paths
+                for network in path.get(
+                    "SourceNetworks",
+                    [],
                 )
-                confidence = "HIGH"
-            else:
-                network_exposure = "BROAD"
-                network_finding = (
-                    "Endpoint security groups allow broad inbound access; no "
-                    "cross-account path was confirmed, but the network control "
-                    "is not restrictive"
-                )
-                confidence = "MEDIUM"
-
-        elif (
-            security_group_result["PeerAllowedRules"]
-            and (peerings or tgw_paths)
-        ):
-            network_exposure = "POTENTIAL_CROSS_ACCOUNT"
-            network_finding = (
-                "A cross-account network path exists and endpoint security "
-                "groups permit a matching source"
-            )
-            confidence = "HIGH"
-
-        elif peerings or tgw_paths or route_indicators:
-            network_exposure = "REVIEW"
-            network_finding = (
-                "Cross-account or external connectivity exists, but endpoint "
-                "security groups did not conclusively allow that source"
-            )
-            confidence = "MEDIUM"
-
-        elif sg_posture == "RESTRICTED":
-            network_exposure = "RESTRICTED"
-            network_finding = (
-                "No broad endpoint security-group rule or confirmed "
-                "cross-account network path was identified"
-            )
-            confidence = "MEDIUM"
-
-        else:
-            network_exposure = "UNKNOWN"
-            network_finding = (
-                "Endpoint security-group posture could not be fully resolved"
-            )
-            confidence = "LOW"
-
-    elif endpoint_type == "GatewayLoadBalancer":
-        if shared_untrusted_principals or peerings or tgw_paths:
-            network_exposure = "REVIEW"
-            network_finding = (
-                "Gateway Load Balancer endpoint participates in an "
-                "architecture with potential cross-account connectivity; "
-                "manual route and service-owner validation is required"
-            )
-            confidence = "LOW"
-        else:
-            network_exposure = "RESTRICTED"
-            network_finding = (
-                "No cross-account sharing or connectivity indicator was "
-                "identified for the Gateway Load Balancer endpoint"
-            )
-            confidence = "LOW"
-
-    else:
-        if shared_untrusted_principals or peerings or tgw_paths:
-            network_exposure = "REVIEW"
-            network_finding = (
-                f"Endpoint type {endpoint_type} has cross-account network "
-                f"indicators requiring manual validation"
-            )
-            confidence = "LOW"
-        else:
-            network_exposure = "UNKNOWN"
-            network_finding = (
-                f"Automated reachability classification for endpoint type "
-                f"{endpoint_type} is limited"
-            )
-            confidence = "LOW"
+            ),
+            "MatchingRoute": "",
+            "PermittingSgRule": "",
+            "RouteValidation": "UNDETERMINED",
+            "SgValidation": "UNDETERMINED",
+            "Confidence": "LOW",
+            "Finding": (
+                "No confirmed accessible path was found, but "
+                "some required network information was unavailable"
+            ),
+            "BroadSgRules": unique_strings(
+                broad_sg_rules_seen
+            ),
+            "Evidence": evidence,
+        }
 
     return {
-        "NetworkExposure": network_exposure,
-        "NetworkFinding": network_finding,
-        "NetworkConfidence": confidence,
-        "SecurityGroupPosture": security_group_result[
-            "SecurityGroupPosture"
-        ],
-        "SecurityGroupFinding": security_group_result[
-            "SecurityGroupFinding"
-        ],
-        "SharedUntrustedPrincipals": shared_untrusted_principals,
-        "CrossAccountPeerings": peerings,
-        "CrossAccountTgwPaths": tgw_paths,
-        "ExternalRouteIndicators": route_indicators,
-        "SecurityGroupBroadRules": security_group_result["BroadRules"],
-        "SecurityGroupPeerAllowedRules": security_group_result[
-            "PeerAllowedRules"
-        ],
+        "Status": "COMPLIANT",
+        "Accessible": "NO",
+        "Reason": (
+            "No untrusted source had both a matching endpoint-"
+            "subnet route and a permitting endpoint security-"
+            "group rule"
+        ),
+        "RecommendedAction": (
+            "No network remediation required. Review any broad "
+            "security-group rules separately and restrict the "
+            "wildcard endpoint policy where possible."
+        ),
+        "PathType": (
+            join_values(
+                path.get("PathType", "")
+                for path in candidate_paths
+            )
+            or "NONE"
+        ),
+        "SourceAccount": "",
+        "SourceNetwork": "",
+        "MatchingRoute": "",
+        "PermittingSgRule": "",
+        "RouteValidation": (
+            "CHECKED"
+            if endpoint_route_tables_list
+            else "NO_ENDPOINT_SUBNET_ROUTE_TABLE"
+        ),
+        "SgValidation": "CHECKED",
+        "Confidence": "HIGH",
+        "Finding": (
+            "External connectivity may exist in the VPC, but "
+            "no complete path to the interface endpoint was "
+            "confirmed"
+        ),
+        "BroadSgRules": unique_strings(
+            broad_sg_rules_seen
+        ),
         "Evidence": evidence,
     }
 
 
 # ============================================================
-# FINAL STATUS
+# SUMMARY ROW
 # ============================================================
 
-def calculate_effective_risk(
-    technical_status: str,
-    network_exposure: str,
-) -> Tuple[str, str]:
-    if technical_status == "COMPLIANT":
-        if network_exposure in {"UNKNOWN", "REVIEW"}:
-            return (
-                "REVIEW",
-                "Policy is trusted-account restricted, but network posture "
-                "requires review",
-            )
-
-        return (
-            "LOW",
-            "Endpoint policy limits access to trusted accounts",
-        )
-
-    if technical_status == "NON_COMPLIANT":
-        if network_exposure in {
-            "BROAD",
-            "POTENTIAL_CROSS_ACCOUNT",
-        }:
-            return (
-                "HIGH",
-                "Open or untrusted endpoint policy is combined with a "
-                "potentially usable untrusted network path",
-            )
-
-        if network_exposure == "RESTRICTED":
-            return (
-                "MITIGATED",
-                "Endpoint policy remains technically non-compliant, but no "
-                "confirmed untrusted network path was identified",
-            )
-
-        return (
-            "REVIEW",
-            "Endpoint policy is technically non-compliant and network "
-            "reachability could not be conclusively determined",
-        )
-
-    if technical_status == "REVIEW":
-        return (
-            "REVIEW",
-            "Policy or network conditions require manual validation",
-        )
-
-    return (
-        "UNKNOWN",
-        "Endpoint could not be fully evaluated",
-    )
-
-
-# ============================================================
-# ROW CREATION
-# ============================================================
-
-def base_summary_row(
+def build_base_row(
     account_id: str,
+    partition: str,
     region: str,
     endpoint: Dict[str, Any],
-    partition: str,
 ) -> Dict[str, Any]:
-    endpoint_id = endpoint.get("VpcEndpointId", "")
+    endpoint_id = endpoint.get(
+        "VpcEndpointId",
+        "",
+    )
+
+    endpoint_type = endpoint.get(
+        "VpcEndpointType",
+        "",
+    )
+
+    service_name = endpoint.get(
+        "ServiceName",
+        "",
+    )
 
     return {
         "Account": account_id,
         "Region": region,
         "Control": CONTROL_NAME,
+        "NetworkComplianceStatus": "",
+        "AccessibleByUntrustedSource": "",
+        "NonComplianceReason": "",
+        "RecommendedAction": "",
         "VpcEndpointId": endpoint_id,
         "VpcEndpointArn": endpoint_arn(
             partition,
@@ -1671,105 +2084,71 @@ def base_summary_row(
             account_id,
             endpoint_id,
         ),
-        "Name": get_name_tag(endpoint),
-        "VpcEndpointType": endpoint.get("VpcEndpointType", ""),
+        "EndpointName": get_name_tag(endpoint),
+        "EndpointType": endpoint_type,
+        "GatewayService": (
+            identify_gateway_service(service_name)
+            if endpoint_type == "Gateway"
+            else "Not applicable"
+        ),
         "State": endpoint.get("State", ""),
         "VpcId": endpoint.get("VpcId", ""),
-        "ServiceName": endpoint.get("ServiceName", ""),
-        "ServiceRegion": endpoint.get("ServiceRegion", ""),
-        "ServiceNetworkArn": endpoint.get("ServiceNetworkArn", ""),
-        "ResourceConfigurationArn": endpoint.get(
-            "ResourceConfigurationArn",
-            "",
-        ),
-        "OwnerId": endpoint.get("OwnerId", account_id),
-        "RequesterManaged": endpoint.get("RequesterManaged", False),
-        "PrivateDnsEnabled": endpoint.get("PrivateDnsEnabled", ""),
-        "IpAddressType": endpoint.get("IpAddressType", ""),
-        "DnsOptions": json_string(endpoint.get("DnsOptions", {})),
-        "SubnetIds": join_values(endpoint.get("SubnetIds", [])),
-        "RouteTableIds": join_values(endpoint.get("RouteTableIds", [])),
-        "SecurityGroupIds": join_values(
-            group.get("GroupId")
-            for group in endpoint.get("Groups", []) or []
-        ),
-        "NetworkInterfaceIds": join_values(
-            endpoint.get("NetworkInterfaceIds", [])
-        ),
-        "CreationTimestamp": timestamp_to_text(
-            endpoint.get("CreationTimestamp")
-        ),
-        "PolicyDocument": endpoint.get("PolicyDocument", ""),
-        "TechnicalStatus": "",
-        "PolicyFinding": "",
-        "WildcardPrincipal": "",
-        "TrustedPrincipals": "",
-        "UntrustedPrincipals": "",
-        "ServicePrincipals": "",
-        "ComplexPolicyElements": "",
-        "NetworkExposure": "",
+        "ServiceName": service_name,
+        "NetworkPathType": "",
+        "UntrustedSourceAccount": "",
+        "UntrustedSourceNetwork": "",
+        "MatchingRoute": "",
+        "PermittingSecurityGroupRule": "",
+        "RouteValidationStatus": "",
+        "SecurityGroupValidationStatus": "",
         "NetworkConfidence": "",
+        "GatewayEndpointRouteTableIds": join_values(
+            endpoint.get("RouteTableIds", [])
+        ),
+        "GatewayEndpointEffectiveSubnetIds": "",
+        "GatewayEndpointSharedSubnetAccounts": "",
+        "InterfaceEndpointSubnetIds": join_values(
+            endpoint.get("SubnetIds", [])
+        ),
+        "InterfaceEndpointSecurityGroupIds": join_values(
+            group.get("GroupId")
+            for group in endpoint.get(
+                "Groups",
+                [],
+            ) or []
+        ),
+        "InterfaceEndpointEniIds": join_values(
+            endpoint.get(
+                "NetworkInterfaceIds",
+                [],
+            )
+        ),
+        "PolicyTechnicalStatus": "",
+        "PolicyContainsWildcard": "",
+        "PolicyUntrustedPrincipals": "",
+        "PolicyFinding": "",
         "NetworkFinding": "",
-        "SecurityGroupPosture": "",
-        "SecurityGroupFinding": "",
-        "SharedUntrustedPrincipals": "",
-        "CrossAccountPeerings": "",
-        "CrossAccountTgwPaths": "",
-        "ExternalRouteIndicators": "",
-        "SecurityGroupBroadRules": "",
-        "SecurityGroupPeerAllowedRules": "",
-        "EffectiveRiskStatus": "",
-        "EffectiveRiskFinding": "",
         "EvaluationStatus": "EVALUATED",
         "Error": "",
     }
 
 
-def skipped_summary_row(
-    account_id: str,
-    region: str,
-    partition: str,
-    error: Exception,
-) -> Dict[str, Any]:
-    row = base_summary_row(
-        account_id,
-        region,
-        {"VpcEndpointId": "N/A"},
-        partition,
-    )
-
-    row.update({
-        "TechnicalStatus": "SKIPPED",
-        "NetworkExposure": "UNKNOWN",
-        "NetworkConfidence": "LOW",
-        "EffectiveRiskStatus": "UNKNOWN",
-        "EvaluationStatus": "SKIPPED",
-        "Error": compact_error(error),
-    })
-
-    return row
-
-
 # ============================================================
-# MAIN CONTROL
+# CONTROL EXECUTION
 # ============================================================
 
 def check_vpc_endpoints(
     session: boto3.Session,
-    trusted_accounts: Set[str],
     regions: List[str],
+    trusted_accounts: Set[str],
     include_inactive: bool,
+    endpoint_port: int,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     account_id = get_account_id(session)
     partition = get_partition(session)
 
     summary_rows: List[Dict[str, Any]] = []
     evidence_rows: List[Dict[str, Any]] = []
-
-    print(f"\nAccount              : {account_id}")
-    print(f"Trusted accounts     : {', '.join(sorted(trusted_accounts))}")
-    print(f"Regions to scan      : {len(regions)}")
-    print(f"Include inactive     : {include_inactive}\n")
 
     region_bar = tqdm(
         regions,
@@ -1782,7 +2161,10 @@ def check_vpc_endpoints(
         region_bar.set_postfix_str(region)
 
         try:
-            ec2 = session.client("ec2", region_name=region)
+            ec2 = session.client(
+                "ec2",
+                region_name=region,
+            )
 
             endpoints = paginate_items(
                 ec2,
@@ -1791,36 +2173,73 @@ def check_vpc_endpoints(
             )
 
         except (ClientError, BotoCoreError) as error:
-            summary_rows.append(
-                skipped_summary_row(
-                    account_id,
-                    region,
-                    partition,
-                    error,
-                )
-            )
+            summary_rows.append({
+                "Account": account_id,
+                "Region": region,
+                "Control": CONTROL_NAME,
+                "NetworkComplianceStatus": "SKIPPED",
+                "AccessibleByUntrustedSource": "UNDETERMINED",
+                "NonComplianceReason": "",
+                "RecommendedAction": (
+                    "Resolve regional API access error"
+                ),
+                "VpcEndpointId": "N/A",
+                "VpcEndpointArn": "",
+                "EndpointName": "",
+                "EndpointType": "",
+                "GatewayService": "",
+                "State": "",
+                "VpcId": "",
+                "ServiceName": "",
+                "NetworkPathType": "",
+                "UntrustedSourceAccount": "",
+                "UntrustedSourceNetwork": "",
+                "MatchingRoute": "",
+                "PermittingSecurityGroupRule": "",
+                "RouteValidationStatus": "",
+                "SecurityGroupValidationStatus": "",
+                "NetworkConfidence": "LOW",
+                "GatewayEndpointRouteTableIds": "",
+                "GatewayEndpointEffectiveSubnetIds": "",
+                "GatewayEndpointSharedSubnetAccounts": "",
+                "InterfaceEndpointSubnetIds": "",
+                "InterfaceEndpointSecurityGroupIds": "",
+                "InterfaceEndpointEniIds": "",
+                "PolicyTechnicalStatus": "",
+                "PolicyContainsWildcard": "",
+                "PolicyUntrustedPrincipals": "",
+                "PolicyFinding": "",
+                "NetworkFinding": "",
+                "EvaluationStatus": "SKIPPED",
+                "Error": error_text(error),
+            })
             continue
 
         if not include_inactive:
             endpoints = [
                 endpoint
                 for endpoint in endpoints
-                if endpoint.get("State") in ACTIVE_ENDPOINT_STATES
+                if endpoint.get("State")
+                in ACTIVE_ENDPOINT_STATES
             ]
 
         if not endpoints:
             continue
 
-        inventory, inventory_errors = load_regional_inventory(ec2)
+        inventory, inventory_errors = load_inventory(
+            ec2
+        )
 
-        shared_subnet_principals, ram_errors = (
+        shared_subnets, ram_errors = (
             get_shared_subnet_principals(
                 session,
                 region,
             )
         )
 
-        regional_errors = inventory_errors + ram_errors
+        regional_errors = (
+            inventory_errors + ram_errors
+        )
 
         endpoint_bar = tqdm(
             endpoints,
@@ -1831,169 +2250,272 @@ def check_vpc_endpoints(
         )
 
         for endpoint in endpoint_bar:
-            endpoint_id = endpoint.get("VpcEndpointId", "UNKNOWN")
-            endpoint_bar.set_postfix_str(endpoint_id)
+            endpoint_id = endpoint.get(
+                "VpcEndpointId",
+                "UNKNOWN",
+            )
 
-            row = base_summary_row(
+            endpoint_bar.set_postfix_str(
+                endpoint_id
+            )
+
+            row = build_base_row(
                 account_id,
+                partition,
                 region,
                 endpoint,
-                partition,
             )
 
             try:
-                policy_document = decode_policy_document(
-                    endpoint.get("PolicyDocument")
-                )
-
-                policy_result = evaluate_policy(
-                    policy_document,
-                    trusted_accounts,
-                )
-
-                network_result = evaluate_network_exposure(
-                    endpoint,
-                    inventory,
-                    shared_subnet_principals,
-                    trusted_accounts,
-                )
-
-                effective_risk, effective_finding = (
-                    calculate_effective_risk(
-                        policy_result["TechnicalStatus"],
-                        network_result["NetworkExposure"],
+                try:
+                    policy_document = decode_policy(
+                        endpoint.get(
+                            "PolicyDocument"
+                        )
                     )
+
+                    policy_result = (
+                        evaluate_policy_information(
+                            policy_document,
+                            trusted_accounts,
+                        )
+                    )
+
+                except Exception as policy_error:
+                    policy_result = {
+                        "Status": "REVIEW",
+                        "Wildcard": "",
+                        "UntrustedPrincipals": [],
+                        "Finding": (
+                            "Policy could not be parsed: "
+                            f"{error_text(policy_error)}"
+                        ),
+                    }
+
+                endpoint_type = endpoint.get(
+                    "VpcEndpointType",
+                    "",
                 )
+
+                if endpoint_type == "Gateway":
+                    network_result = (
+                        evaluate_gateway_endpoint(
+                            endpoint,
+                            inventory,
+                            shared_subnets,
+                            trusted_accounts,
+                        )
+                    )
+
+                elif endpoint_type == "Interface":
+                    network_result = (
+                        evaluate_interface_endpoint(
+                            endpoint,
+                            inventory,
+                            shared_subnets,
+                            trusted_accounts,
+                            endpoint_port,
+                        )
+                    )
+
+                else:
+                    network_result = {
+                        "Status": "REVIEW",
+                        "Accessible": "UNDETERMINED",
+                        "Reason": (
+                            f"Endpoint type {endpoint_type} "
+                            f"requires type-specific review"
+                        ),
+                        "RecommendedAction": (
+                            "Review the endpoint architecture manually"
+                        ),
+                        "PathType": "",
+                        "SourceAccount": "",
+                        "SourceNetwork": "",
+                        "MatchingRoute": "",
+                        "PermittingSgRule": "",
+                        "RouteValidation": "UNDETERMINED",
+                        "SgValidation": "UNDETERMINED",
+                        "Confidence": "LOW",
+                        "Finding": (
+                            "Automated evaluation is not implemented "
+                            "for this endpoint type"
+                        ),
+                        "BroadSgRules": [],
+                        "Evidence": [],
+                    }
 
                 row.update({
-                    "TechnicalStatus": policy_result[
-                        "TechnicalStatus"
-                    ],
-                    "PolicyFinding": policy_result["PolicyFinding"],
-                    "WildcardPrincipal": policy_result[
-                        "WildcardPrincipal"
-                    ],
-                    "TrustedPrincipals": join_values(
-                        policy_result["TrustedPrincipals"]
+                    "NetworkComplianceStatus": (
+                        network_result["Status"]
                     ),
-                    "UntrustedPrincipals": join_values(
-                        policy_result["UntrustedPrincipals"]
+                    "AccessibleByUntrustedSource": (
+                        network_result["Accessible"]
                     ),
-                    "ServicePrincipals": join_values(
-                        policy_result["ServicePrincipals"]
+                    "NonComplianceReason": (
+                        network_result["Reason"]
+                        if network_result["Status"]
+                        in {"NON_COMPLIANT", "REVIEW"}
+                        else ""
                     ),
-                    "ComplexPolicyElements": join_values(
-                        policy_result["ComplexStatements"]
-                    ),
-                    "NetworkExposure": network_result[
-                        "NetworkExposure"
-                    ],
-                    "NetworkConfidence": network_result[
-                        "NetworkConfidence"
-                    ],
-                    "NetworkFinding": network_result["NetworkFinding"],
-                    "SecurityGroupPosture": network_result[
-                        "SecurityGroupPosture"
-                    ],
-                    "SecurityGroupFinding": network_result[
-                        "SecurityGroupFinding"
-                    ],
-                    "SharedUntrustedPrincipals": json_string(
-                        network_result["SharedUntrustedPrincipals"]
-                    ),
-                    "CrossAccountPeerings": json_string(
-                        network_result["CrossAccountPeerings"]
-                    ),
-                    "CrossAccountTgwPaths": json_string(
-                        network_result["CrossAccountTgwPaths"]
-                    ),
-                    "ExternalRouteIndicators": json_string(
-                        network_result["ExternalRouteIndicators"]
-                    ),
-                    "SecurityGroupBroadRules": join_values(
-                        network_result["SecurityGroupBroadRules"]
-                    ),
-                    "SecurityGroupPeerAllowedRules": join_values(
+                    "RecommendedAction": (
                         network_result[
-                            "SecurityGroupPeerAllowedRules"
+                            "RecommendedAction"
                         ]
                     ),
-                    "EffectiveRiskStatus": effective_risk,
-                    "EffectiveRiskFinding": effective_finding,
+                    "NetworkPathType": (
+                        network_result["PathType"]
+                    ),
+                    "UntrustedSourceAccount": (
+                        network_result[
+                            "SourceAccount"
+                        ]
+                    ),
+                    "UntrustedSourceNetwork": (
+                        network_result[
+                            "SourceNetwork"
+                        ]
+                    ),
+                    "MatchingRoute": (
+                        network_result[
+                            "MatchingRoute"
+                        ]
+                    ),
+                    "PermittingSecurityGroupRule": (
+                        network_result[
+                            "PermittingSgRule"
+                        ]
+                    ),
+                    "RouteValidationStatus": (
+                        network_result[
+                            "RouteValidation"
+                        ]
+                    ),
+                    "SecurityGroupValidationStatus": (
+                        network_result[
+                            "SgValidation"
+                        ]
+                    ),
+                    "NetworkConfidence": (
+                        network_result[
+                            "Confidence"
+                        ]
+                    ),
+                    "PolicyTechnicalStatus": (
+                        policy_result["Status"]
+                    ),
+                    "PolicyContainsWildcard": (
+                        policy_result["Wildcard"]
+                    ),
+                    "PolicyUntrustedPrincipals": (
+                        join_values(
+                            policy_result[
+                                "UntrustedPrincipals"
+                            ]
+                        )
+                    ),
+                    "PolicyFinding": (
+                        policy_result["Finding"]
+                    ),
+                    "NetworkFinding": (
+                        network_result["Finding"]
+                    ),
                 })
 
-                for item in network_result["Evidence"]:
-                    evidence_rows.append({
-                        "Account": account_id,
-                        "Region": region,
-                        "Control": CONTROL_NAME,
-                        "VpcEndpointId": endpoint_id,
-                        "VpcEndpointArn": row["VpcEndpointArn"],
-                        "VpcEndpointType": row["VpcEndpointType"],
-                        "VpcId": row["VpcId"],
-                        "ServiceName": row["ServiceName"],
-                        "TechnicalStatus": row["TechnicalStatus"],
-                        "NetworkExposure": row["NetworkExposure"],
-                        "EffectiveRiskStatus": row[
-                            "EffectiveRiskStatus"
-                        ],
-                        "EvidenceType": item.get(
-                            "EvidenceType",
-                            "",
-                        ),
-                        "ResourceId": item.get("ResourceId", ""),
-                        "Direction": item.get("Direction", ""),
-                        "Protocol": item.get("Protocol", ""),
-                        "Ports": item.get("Ports", ""),
-                        "Source": item.get("Source", ""),
-                        "Detail": item.get("Detail", ""),
-                    })
+                if endpoint_type == "Gateway":
+                    row[
+                        "GatewayEndpointEffectiveSubnetIds"
+                    ] = join_values(
+                        network_result[
+                            "EffectiveSubnetIds"
+                        ]
+                    )
 
-                for regional_error in regional_errors:
-                    evidence_rows.append({
-                        "Account": account_id,
-                        "Region": region,
-                        "Control": CONTROL_NAME,
-                        "VpcEndpointId": endpoint_id,
-                        "VpcEndpointArn": row["VpcEndpointArn"],
-                        "VpcEndpointType": row["VpcEndpointType"],
-                        "VpcId": row["VpcId"],
-                        "ServiceName": row["ServiceName"],
-                        "TechnicalStatus": row["TechnicalStatus"],
-                        "NetworkExposure": row["NetworkExposure"],
-                        "EffectiveRiskStatus": row[
-                            "EffectiveRiskStatus"
-                        ],
-                        "EvidenceType": "INVENTORY_WARNING",
-                        "ResourceId": "",
-                        "Direction": "",
-                        "Protocol": "",
-                        "Ports": "",
-                        "Source": "",
-                        "Detail": regional_error,
-                    })
+                    row[
+                        "GatewayEndpointSharedSubnetAccounts"
+                    ] = join_values(
+                        item["Principal"]
+                        for item in network_result[
+                            "SharedAccounts"
+                        ]
+                    )
 
                 if regional_errors:
-                    row["Error"] = join_values(regional_errors)
+                    row["Error"] = join_values(
+                        regional_errors
+                    )
+
+                    # Do not override a confirmed result merely because
+                    # unrelated inventory calls failed. The errors remain
+                    # visible for review.
+                    if (
+                        row["NetworkComplianceStatus"]
+                        == "COMPLIANT"
+                        and any(
+                            operation in row["Error"]
+                            for operation in [
+                                "describe_route_tables",
+                                "describe_security_groups",
+                                "describe_subnets",
+                            ]
+                        )
+                    ):
+                        row[
+                            "NetworkComplianceStatus"
+                        ] = "REVIEW"
+
+                        row[
+                            "AccessibleByUntrustedSource"
+                        ] = "UNDETERMINED"
+
+                        row[
+                            "NonComplianceReason"
+                        ] = (
+                            "Required route, subnet or "
+                            "security-group inventory was incomplete"
+                        )
+
+                        row[
+                            "NetworkConfidence"
+                        ] = "LOW"
+
+                for item in network_result[
+                    "Evidence"
+                ]:
+                    evidence_rows.append({
+                        "Account": account_id,
+                        "Region": region,
+                        "VpcEndpointId": endpoint_id,
+                        "EndpointType": endpoint_type,
+                        "ServiceName": endpoint.get(
+                            "ServiceName",
+                            "",
+                        ),
+                        "NetworkComplianceStatus": row[
+                            "NetworkComplianceStatus"
+                        ],
+                        **item,
+                    })
 
             except Exception as error:
                 row.update({
-                    "TechnicalStatus": "REVIEW",
-                    "PolicyFinding": (
-                        "Endpoint evaluation failed before a reliable "
-                        "technical conclusion could be reached"
+                    "NetworkComplianceStatus": "REVIEW",
+                    "AccessibleByUntrustedSource": (
+                        "UNDETERMINED"
                     ),
-                    "NetworkExposure": "UNKNOWN",
+                    "NonComplianceReason": (
+                        "Endpoint evaluation failed before "
+                        "a reliable network conclusion was reached"
+                    ),
+                    "RecommendedAction": (
+                        "Review the endpoint and the error field"
+                    ),
                     "NetworkConfidence": "LOW",
                     "NetworkFinding": (
-                        "Network exposure could not be evaluated"
-                    ),
-                    "EffectiveRiskStatus": "REVIEW",
-                    "EffectiveRiskFinding": (
-                        "Manual validation required due to evaluation error"
+                        "Manual validation required"
                     ),
                     "EvaluationStatus": "PARTIAL",
-                    "Error": compact_error(error),
+                    "Error": error_text(error),
                 })
 
             summary_rows.append(row)
@@ -2002,79 +2524,8 @@ def check_vpc_endpoints(
 
 
 # ============================================================
-# CSV OUTPUT
+# OUTPUT
 # ============================================================
-
-SUMMARY_FIELDS = [
-    "Account",
-    "Region",
-    "Control",
-    "VpcEndpointId",
-    "VpcEndpointArn",
-    "Name",
-    "VpcEndpointType",
-    "State",
-    "VpcId",
-    "ServiceName",
-    "ServiceRegion",
-    "ServiceNetworkArn",
-    "ResourceConfigurationArn",
-    "OwnerId",
-    "RequesterManaged",
-    "PrivateDnsEnabled",
-    "IpAddressType",
-    "DnsOptions",
-    "SubnetIds",
-    "RouteTableIds",
-    "SecurityGroupIds",
-    "NetworkInterfaceIds",
-    "CreationTimestamp",
-    "TechnicalStatus",
-    "PolicyFinding",
-    "WildcardPrincipal",
-    "TrustedPrincipals",
-    "UntrustedPrincipals",
-    "ServicePrincipals",
-    "ComplexPolicyElements",
-    "NetworkExposure",
-    "NetworkConfidence",
-    "NetworkFinding",
-    "SecurityGroupPosture",
-    "SecurityGroupFinding",
-    "SharedUntrustedPrincipals",
-    "CrossAccountPeerings",
-    "CrossAccountTgwPaths",
-    "ExternalRouteIndicators",
-    "SecurityGroupBroadRules",
-    "SecurityGroupPeerAllowedRules",
-    "EffectiveRiskStatus",
-    "EffectiveRiskFinding",
-    "EvaluationStatus",
-    "Error",
-    "PolicyDocument",
-]
-
-EVIDENCE_FIELDS = [
-    "Account",
-    "Region",
-    "Control",
-    "VpcEndpointId",
-    "VpcEndpointArn",
-    "VpcEndpointType",
-    "VpcId",
-    "ServiceName",
-    "TechnicalStatus",
-    "NetworkExposure",
-    "EffectiveRiskStatus",
-    "EvidenceType",
-    "ResourceId",
-    "Direction",
-    "Protocol",
-    "Ports",
-    "Source",
-    "Detail",
-]
-
 
 def write_csv(
     filename: str,
@@ -2094,137 +2545,133 @@ def write_csv(
         )
 
         writer.writeheader()
+        writer.writerows(rows)
 
-        for row in rows:
-            writer.writerow(row)
-
-
-# ============================================================
-# TERMINAL SUMMARY
-# ============================================================
 
 def print_summary(
     account_id: str,
-    summary_rows: List[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
 ) -> None:
-    actual_rows = [
+    endpoint_rows = [
         row
-        for row in summary_rows
+        for row in rows
         if row.get("VpcEndpointId") != "N/A"
     ]
 
-    total = len(actual_rows)
-
-    technical_counts: Dict[str, int] = defaultdict(int)
-    network_counts: Dict[str, int] = defaultdict(int)
-    risk_counts: Dict[str, int] = defaultdict(int)
+    status_counts: Dict[str, int] = defaultdict(int)
     type_counts: Dict[str, int] = defaultdict(int)
+    gateway_service_counts: Dict[str, int] = defaultdict(int)
 
-    for row in actual_rows:
-        technical_counts[row.get("TechnicalStatus", "UNKNOWN")] += 1
-        network_counts[row.get("NetworkExposure", "UNKNOWN")] += 1
-        risk_counts[row.get("EffectiveRiskStatus", "UNKNOWN")] += 1
-        type_counts[row.get("VpcEndpointType", "Unknown")] += 1
+    for row in endpoint_rows:
+        status_counts[
+            row.get(
+                "NetworkComplianceStatus",
+                "UNKNOWN",
+            )
+        ] += 1
+
+        type_counts[
+            row.get("EndpointType", "Unknown")
+        ] += 1
+
+        if row.get("EndpointType") == "Gateway":
+            gateway_service_counts[
+                row.get(
+                    "GatewayService",
+                    "Unknown",
+                )
+            ] += 1
 
     skipped_regions = sum(
         1
-        for row in summary_rows
+        for row in rows
         if row.get("EvaluationStatus") == "SKIPPED"
     )
 
     print("\n============================================================")
     print(f"CONTROL : {CONTROL_NAME}")
     print(f"ACCOUNT : {account_id}")
+    print("RESULT  : NETWORK ACCESSIBILITY EXCLUDING POLICY")
     print("============================================================")
 
-    print(f"\nTotal VPC endpoints evaluated : {total}")
-    print(f"Skipped region records        : {skipped_regions}")
+    print(
+        f"\nTotal VPC endpoints evaluated : "
+        f"{len(endpoint_rows)}"
+    )
+    print(
+        f"Skipped region records        : "
+        f"{skipped_regions}"
+    )
 
     print("\nEndpoint types")
     print("------------------------------------------------------------")
-    for endpoint_type, count in sorted(type_counts.items()):
+
+    for endpoint_type, count in sorted(
+        type_counts.items()
+    ):
         print(f"{endpoint_type:<32}: {count}")
 
-    print("\nTechnical policy status")
+    if gateway_service_counts:
+        print("\nGateway endpoint services checked")
+        print("------------------------------------------------------------")
+
+        for service, count in sorted(
+            gateway_service_counts.items()
+        ):
+            print(f"{service:<32}: {count}")
+
+    print("\nNetwork compliance status")
     print("------------------------------------------------------------")
+
     for status in [
         "COMPLIANT",
         "NON_COMPLIANT",
         "REVIEW",
         "SKIPPED",
-        "UNKNOWN",
     ]:
-        print(f"{status:<32}: {technical_counts.get(status, 0)}")
+        print(
+            f"{status:<32}: "
+            f"{status_counts.get(status, 0)}"
+        )
 
-    print("\nNetwork exposure")
-    print("------------------------------------------------------------")
-    for status in [
-        "RESTRICTED",
-        "POTENTIAL_CROSS_ACCOUNT",
-        "BROAD",
-        "REVIEW",
-        "UNKNOWN",
-    ]:
-        print(f"{status:<32}: {network_counts.get(status, 0)}")
-
-    print("\nEffective risk")
-    print("------------------------------------------------------------")
-    for status in [
-        "LOW",
-        "MITIGATED",
-        "HIGH",
-        "REVIEW",
-        "UNKNOWN",
-    ]:
-        print(f"{status:<32}: {risk_counts.get(status, 0)}")
-
-    if technical_counts.get("NON_COMPLIANT", 0) > 0:
+    if status_counts.get("NON_COMPLIANT", 0):
         overall = "NON_COMPLIANT"
-    elif technical_counts.get("REVIEW", 0) > 0:
+
+    elif status_counts.get("REVIEW", 0):
         overall = "REVIEW"
-    elif total == 0:
-        overall = "NO_RESOURCES"
-    else:
+
+    elif endpoint_rows:
         overall = "COMPLIANT"
 
-    print(f"\nOVERALL TECHNICAL STATUS: {overall}")
+    else:
+        overall = "NO_RESOURCES"
+
+    print(
+        f"\nOVERALL NETWORK STATUS: {overall}"
+    )
     print("============================================================\n")
 
-
-def print_high_risk_endpoints(
-    summary_rows: List[Dict[str, Any]],
-    limit: int = 25,
-) -> None:
-    high_risk = [
+    failing = [
         row
-        for row in summary_rows
-        if row.get("EffectiveRiskStatus") in {"HIGH", "REVIEW"}
-        and row.get("VpcEndpointId") != "N/A"
+        for row in endpoint_rows
+        if row.get("NetworkComplianceStatus")
+        in {"NON_COMPLIANT", "REVIEW"}
     ]
 
-    if not high_risk:
-        return
+    if failing:
+        print("Endpoints requiring attention")
+        print("------------------------------------------------------------")
 
-    print("Endpoints requiring immediate review")
-    print("------------------------------------------------------------")
+        for row in failing:
+            print(
+                f"{row['Region']:<15} "
+                f"{row['VpcEndpointId']:<24} "
+                f"{row['EndpointType']:<12} "
+                f"{row['NetworkComplianceStatus']:<14} "
+                f"{row['NonComplianceReason']}"
+            )
 
-    for row in high_risk[:limit]:
-        print(
-            f"{row['Region']:<15} "
-            f"{row['VpcEndpointId']:<24} "
-            f"{row['VpcEndpointType']:<20} "
-            f"Policy={row['TechnicalStatus']:<14} "
-            f"Network={row['NetworkExposure']:<24} "
-            f"Risk={row['EffectiveRiskStatus']}"
-        )
-
-    if len(high_risk) > limit:
-        print(
-            f"...and {len(high_risk) - limit} additional endpoints. "
-            f"Review the summary CSV."
-        )
-
-    print()
+        print()
 
 
 # ============================================================
@@ -2233,18 +2680,18 @@ def print_high_risk_endpoints(
 
 def parse_trusted_accounts(
     own_account_id: str,
-    account_arguments: List[str],
+    arguments: List[str],
 ) -> Set[str]:
     trusted = {own_account_id}
 
-    for argument in account_arguments:
+    for argument in arguments:
         for account in argument.split(","):
             account = account.strip()
 
             if not account:
                 continue
 
-            if not ACCOUNT_ID_PATTERN.fullmatch(account):
+            if not ACCOUNT_ID_RE.fullmatch(account):
                 raise ValueError(
                     f"Invalid trusted account ID: {account}. "
                     f"Expected exactly 12 digits."
@@ -2258,13 +2705,15 @@ def parse_trusted_accounts(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=CONTROL_NAME,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=(
+            argparse.ArgumentDefaultsHelpFormatter
+        ),
     )
 
     parser.add_argument(
         "-R",
         "--role-arn",
-        help="IAM role ARN to assume before performing the audit",
+        help="IAM role ARN to assume",
     )
 
     parser.add_argument(
@@ -2272,9 +2721,9 @@ def main() -> None:
         action="append",
         default=[],
         help=(
-            "Trusted 12-digit AWS account ID. May be repeated or supplied "
-            "as a comma-separated list. The scanned account is trusted "
-            "automatically."
+            "Approved 12-digit AWS account ID. "
+            "May be repeated or comma-separated. "
+            "The scanned account is automatically trusted."
         ),
     )
 
@@ -2282,31 +2731,31 @@ def main() -> None:
         "--regions",
         nargs="+",
         help=(
-            "Regions to scan. When omitted, all enabled regions are scanned."
+            "Specific regions to scan. "
+            "All enabled regions are scanned when omitted."
         ),
     )
 
     parser.add_argument(
         "--include-inactive",
         action="store_true",
+        help="Include inactive VPC endpoints",
+    )
+
+    parser.add_argument(
+        "--endpoint-port",
+        type=int,
+        default=443,
         help=(
-            "Include endpoints whose state is not available or pending."
+            "Interface endpoint destination port used for "
+            "security-group correlation"
         ),
     )
 
     parser.add_argument(
         "--output-dir",
         default=".",
-        help="Directory in which CSV reports will be written",
-    )
-
-    parser.add_argument(
-        "--high-risk-print-limit",
-        type=int,
-        default=25,
-        help=(
-            "Maximum number of HIGH/REVIEW endpoints printed to the terminal"
-        ),
+        help="Output directory for CSV reports",
     )
 
     args = parser.parse_args()
@@ -2320,28 +2769,53 @@ def main() -> None:
             args.trusted_account,
         )
 
-        if args.regions:
-            regions = sorted(set(args.regions))
-        else:
-            regions = get_enabled_regions(session)
+        regions = (
+            sorted(set(args.regions))
+            if args.regions
+            else get_enabled_regions(session)
+        )
 
-        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(
+            args.output_dir,
+            exist_ok=True,
+        )
 
-        summary_rows, evidence_rows = check_vpc_endpoints(
-            session=session,
-            trusted_accounts=trusted_accounts,
-            regions=regions,
-            include_inactive=args.include_inactive,
+        print(f"\nAccount          : {account_id}")
+        print(
+            f"Trusted accounts : "
+            f"{join_values(sorted(trusted_accounts))}"
+        )
+        print(
+            f"Regions          : {len(regions)}"
+        )
+        print(
+            f"Endpoint port    : {args.endpoint_port}\n"
+        )
+
+        summary_rows, evidence_rows = (
+            check_vpc_endpoints(
+                session=session,
+                regions=regions,
+                trusted_accounts=trusted_accounts,
+                include_inactive=args.include_inactive,
+                endpoint_port=args.endpoint_port,
+            )
         )
 
         summary_filename = os.path.join(
             args.output_dir,
-            f"vpc_endpoint_trusted_accounts_summary_{account_id}.csv",
+            (
+                f"vpc_endpoint_network_access_"
+                f"{account_id}.csv"
+            ),
         )
 
         evidence_filename = os.path.join(
             args.output_dir,
-            f"vpc_endpoint_trusted_accounts_evidence_{account_id}.csv",
+            (
+                f"vpc_endpoint_network_evidence_"
+                f"{account_id}.csv"
+            ),
         )
 
         write_csv(
@@ -2356,23 +2830,28 @@ def main() -> None:
             evidence_rows,
         )
 
-        print_summary(account_id, summary_rows)
-
-        print_high_risk_endpoints(
+        print_summary(
+            account_id,
             summary_rows,
-            limit=max(args.high_risk_print_limit, 0),
         )
 
-        print(f"Summary CSV  : {summary_filename}")
-        print(f"Evidence CSV : {evidence_filename}\n")
+        print(
+            f"Clear summary CSV : {summary_filename}"
+        )
+        print(
+            f"Evidence CSV      : {evidence_filename}\n"
+        )
 
     except KeyboardInterrupt:
-        print("\nAudit interrupted by user.", file=sys.stderr)
+        print(
+            "\nAudit interrupted by user.",
+            file=sys.stderr,
+        )
         sys.exit(130)
 
     except Exception as error:
         print(
-            f"\nFatal error: {compact_error(error)}",
+            f"\nFatal error: {error_text(error)}",
             file=sys.stderr,
         )
         sys.exit(1)
